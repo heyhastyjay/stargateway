@@ -1,0 +1,16 @@
+[Unit]
+Description=Starlink festival per-device paywall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/starlinkpayment
+EnvironmentFile=/opt/starlinkpayment/.env
+ExecStart=/usr/bin/node /opt/starlinkpayment/node_modules/tsx/dist/cli.mjs src/index.ts
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

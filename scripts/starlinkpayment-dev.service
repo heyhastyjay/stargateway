@@ -1,0 +1,19 @@
+[Unit]
+Description=Starlink paywall local dev (tsx watch, host network)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jaybird/jayprograms/starlinkpayment
+EnvironmentFile=-/home/jaybird/jayprograms/starlinkpayment/.env
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+# Bypass socket-npm alias; invoke node+tsx directly
+ExecStart=/usr/bin/node /home/jaybird/jayprograms/starlinkpayment/node_modules/tsx/dist/cli.mjs watch src/index.ts
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:/home/jaybird/jayprograms/starlinkpayment/data/dev-server.log
+StandardError=append:/home/jaybird/jayprograms/starlinkpayment/data/dev-server.log
+
+[Install]
+WantedBy=default.target

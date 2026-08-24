@@ -1,0 +1,31 @@
+Day-of-burn link troubleshooting
+================================
+
+When on playa, verify these open through camp Starlink / captive portal.
+Update status and working URLs here as you test.
+
+BMIR live stream
+---------------
+- Button on portal → https://bmir.org/
+- Status (pre-event): often off-air until ~Wednesday before gates
+- Alternates to try if bmir.org fails:
+  - https://www.iheart.com/live/bmir-945-8378/  (US / iHeart)
+  - https://burningman.org/black-rock-city/preparation/brc-dashboard/
+  - TuneIn / Streema search: BMIR / Burning Man Information Radio
+- Notes:
+
+
+
+Other links to re-check on playa
+--------------------------------
+- BRC Dashboard: https://burningman.org/black-rock-city/preparation/brc-dashboard/
+- Venmo pay deep links
+- Weather / Open-Meteo fetches
+- Site whitelist / dnsmasq free destinations
+
+
+
+Whitelist / DNS
+---------------
+If a stream host works in browser but stalls on locked Wi‑Fi, add its hostnames
+to the paywall free list and re-sync dnsmasq.
