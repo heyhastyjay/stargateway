@@ -18,6 +18,8 @@ export interface HourlyPoint {
   uvIndex: number;
   /** WMO weather interpretation code (Open-Meteo). */
   weatherCode: number;
+  /** PM2.5 US AQI (Open-Meteo CAMS concentration, EPA breakpoints). */
+  usAqi?: number | null;
 }
 
 export interface BrcAstro {
@@ -43,7 +45,7 @@ export interface BrcWeather {
   updated: string | null;
   /** Rolling next 24 hours starting at the current local hour. */
   hours: HourlyPoint[];
-  /** Today's sun / moon times + phase (Black Rock City). */
+  /** Next upcoming sun / moon event times + today's phase (Black Rock City). */
   astro: BrcAstro | null;
   /** Local YYYY-MM-DD of this calendar month's full moon, when known. */
   fullMoonDate: string | null;
@@ -347,10 +349,66 @@ function emptyIso(v: unknown): string | null {
   return s.length ? s : null;
 }
 
+/** Current local wall time as `YYYY-MM-DDTHH:MM` (same shape as Open-Meteo daily times). */
+export function currentLocalMinuteKey(now = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "00";
+  let hour = get("hour");
+  if (hour === "24") hour = "00";
+  hour = hour.padStart(2, "0");
+  const minute = get("minute").padStart(2, "0");
+  return `${get("year")}-${get("month")}-${get("day")}T${hour}:${minute}`;
+}
+
+type AstroEventField = "sunrise" | "sunset" | "moonrise" | "moonset";
+
+function astroMinuteKey(isoLocal: string | null): string | null {
+  if (!isoLocal) return null;
+  const key = isoLocal.trim().slice(0, 16);
+  return key.length === 16 ? key : null;
+}
+
+/** First future occurrence of `field` at or after `nowMinuteKey` (local ISO minutes). */
+export function nextAstroEventIso(
+  daily: BrcAstro[],
+  field: AstroEventField,
+  nowMinuteKey: string,
+): string | null {
+  for (const day of daily) {
+    const iso = day[field];
+    const key = astroMinuteKey(iso);
+    if (key && key >= nowMinuteKey) return iso;
+  }
+  return null;
+}
+
+/**
+ * Today's moon phase / weather code, with each sun/moon clock set to the next
+ * cycle that has not already passed (so noon shows tomorrow's sunrise).
+ */
 export function pickTodaysAstro(daily: BrcAstro[], now = new Date()): BrcAstro | null {
   if (!daily.length) return null;
-  const key = currentLocalDateKey(now);
-  return daily.find((d) => d.date === key) ?? daily[0] ?? null;
+  const todayKey = currentLocalDateKey(now);
+  const today = daily.find((d) => d.date === todayKey) ?? daily[0]!;
+  const nowMinuteKey = currentLocalMinuteKey(now);
+  const ordered = daily.slice().sort((a, b) => a.date.localeCompare(b.date));
+  return {
+    date: today.date,
+    weatherCode: today.weatherCode,
+    moonPhase: today.moonPhase,
+    sunrise: nextAstroEventIso(ordered, "sunrise", nowMinuteKey),
+    sunset: nextAstroEventIso(ordered, "sunset", nowMinuteKey),
+    moonrise: nextAstroEventIso(ordered, "moonrise", nowMinuteKey),
+    moonset: nextAstroEventIso(ordered, "moonset", nowMinuteKey),
+  };
 }
 
 async function fetchOpenMeteo(): Promise<{ series: HourlyPoint[]; daily: BrcAstro[] }> {
@@ -426,6 +484,7 @@ async function fetchOpenMeteo(): Promise<{ series: HourlyPoint[]; daily: BrcAstr
     windDirDeg: Number(h?.wind_direction_10m?.[i] ?? 0),
     uvIndex: Number(h?.uv_index?.[i] ?? 0),
     weatherCode: Number(h?.weather_code?.[i] ?? 0),
+    usAqi: null,
   }));
 
   const d = json.daily;
@@ -443,6 +502,62 @@ async function fetchOpenMeteo(): Promise<{ series: HourlyPoint[]; daily: BrcAstr
   return { series, daily };
 }
 
+async function fetchOpenMeteoUsAqi(): Promise<Map<string, number>> {
+  const url = new URL("https://air-quality-api.open-meteo.com/v1/air-quality");
+  url.searchParams.set("latitude", String(BRC_LAT));
+  url.searchParams.set("longitude", String(BRC_LON));
+  // Hourly PM2.5 concentration — same pollutant as the AirNow chip.
+  // Do not use consolidated us_aqi: it is often ozone and a 24h average.
+  url.searchParams.set("hourly", "pm2_5");
+  url.searchParams.set("timezone", TIMEZONE);
+  url.searchParams.set("forecast_days", "3");
+
+  const res = await fetch(url, {
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (!res.ok) throw new Error(`Open-Meteo AQI ${res.status}`);
+
+  const json = (await res.json()) as {
+    hourly?: { time?: string[]; pm2_5?: Array<number | null> };
+  };
+  const times = json.hourly?.time ?? [];
+  const values = json.hourly?.pm2_5 ?? [];
+  const map = new Map<string, number>();
+  for (let i = 0; i < times.length; i++) {
+    const pm = Number(values[i]);
+    if (!Number.isFinite(pm)) continue;
+    map.set(times[i], pm25ToUsAqi(pm));
+  }
+  return map;
+}
+
+/** EPA PM2.5 (µg/m³, truncated to 0.1) → US AQI. */
+export function pm25ToUsAqi(pm25: number): number {
+  const c = Math.floor(Math.max(0, pm25) * 10) / 10;
+  const breaks: Array<[number, number, number, number]> = [
+    [0.0, 12.0, 0, 50],
+    [12.1, 35.4, 51, 100],
+    [35.5, 55.4, 101, 150],
+    [55.5, 150.4, 151, 200],
+    [150.5, 250.4, 201, 300],
+    [250.5, 350.4, 301, 400],
+    [350.5, 500.4, 401, 500],
+  ];
+  const row = breaks.find(([, chi]) => c <= chi) ?? breaks[breaks.length - 1];
+  const [clo, chi, ilo, ihi] = row;
+  if (chi <= clo) return ihi;
+  return Math.round(((c - clo) / (chi - clo)) * (ihi - ilo) + ilo);
+}
+
+function withUsAqi(series: HourlyPoint[], aqiByTime: Map<string, number>): HourlyPoint[] {
+  if (!aqiByTime.size) return series;
+  return series.map((h) => {
+    const aqi = aqiByTime.get(h.time);
+    return aqi == null ? h : { ...h, usAqi: aqi };
+  });
+}
+
 export async function getBrcWeather(force = false): Promise<BrcWeather> {
   if (!force && cache && Date.now() - cache.at < CACHE_MS) {
     const hours = sliceRolling24(cache.series);
@@ -454,8 +569,12 @@ export async function getBrcWeather(force = false): Promise<BrcWeather> {
   const dashboard = await fetchBrcDashboard();
 
   try {
-    const { series, daily } = await fetchOpenMeteo();
-    const hours = sliceRolling24(series);
+    const [{ series, daily }, aqiByTime] = await Promise.all([
+      fetchOpenMeteo(),
+      fetchOpenMeteoUsAqi().catch(() => new Map<string, number>()),
+    ]);
+    const merged = withUsAqi(series, aqiByTime);
+    const hours = sliceRolling24(merged);
     const astro = pickTodaysAstro(daily);
     const fullMoonDate = fullMoonDateThisMonth(daily);
     const data: BrcWeather = {
@@ -465,7 +584,7 @@ export async function getBrcWeather(force = false): Promise<BrcWeather> {
       fullMoonDate,
       dashboard,
     };
-    cache = { at: Date.now(), series, daily, data };
+    cache = { at: Date.now(), series: merged, daily, data };
     return data;
   } catch (err) {
     const message = err instanceof Error ? err.message : "Weather unavailable";

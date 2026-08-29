@@ -23,7 +23,7 @@ async function main() {
     void syncSiteWhitelistNetwork();
   }, 15 * 60_000).unref();
 
-  serve(
+  const server = serve(
     {
       fetch: app.fetch,
       hostname: config.host,
@@ -36,6 +36,9 @@ async function main() {
       console.log(`Firewall: ${config.firewallEnabled ? "enabled" : "disabled"}`);
     },
   );
+  if ("requestTimeout" in server) {
+    (server as { requestTimeout: number }).requestTimeout = 0;
+  }
 }
 
 main().catch((err) => {

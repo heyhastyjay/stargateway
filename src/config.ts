@@ -29,10 +29,14 @@ export const config = {
   portalIp: process.env.PORTAL_IP ?? "10.0.0.1",
   portalPort: Number(process.env.PORTAL_PORT ?? process.env.PORT ?? 8080),
   devClientMac: process.env.DEV_CLIENT_MAC?.toLowerCase() ?? null,
+  /** Comma-separated factory Wi‑Fi MACs allowed to set remaining Starlink data. */
+  dataOperatorIds: process.env.DATA_OPERATOR_IDS ?? "",
   /** Upstream resolver used in dnsmasq exceptions for crowd-approved sites. */
   whitelistUpstreamDns: process.env.WHITELIST_UPSTREAM_DNS ?? "8.8.8.8",
   dnsmasqWhitelistConf:
     process.env.DNSMASQ_WHITELIST_CONF ?? "/etc/dnsmasq.d/starlink-paywall-whitelist.conf",
+  dnsmasqBlocklistConf:
+    process.env.DNSMASQ_BLOCKLIST_CONF ?? "/etc/dnsmasq.d/starlink-paywall-block.conf",
 };
 
 export type Config = typeof config;

@@ -21,7 +21,7 @@ export const LIBREWXR_ATTR =
   'Radar &copy; <a href="https://librewxr.net/">LibreWXR</a> (MRMS)';
 
 const MIN_ZOOM = 5;
-const DEFAULT_ZOOM = 9;
+const DEFAULT_ZOOM = 8;
 const MAX_ZOOM = 12;
 /** Universal Blue + smooth edges + snow tint. */
 const COLOR_SCHEME = 2;
@@ -179,8 +179,10 @@ export async function buildLibreWxrRadarPayload(
     },
     radarAttribution: LIBREWXR_ATTR,
     opacity: 0.72,
-    frameMs: 1200,
-    blendMs: 800,
+    /** Unused hold — the client runs a continuous crossfade. */
+    frameMs: 0,
+    /** Milliseconds per frame; the whole interval is a blend. */
+    blendMs: 220,
     frames,
     mapPageUrl: externalRadarMapUrl(lat, lon, zoom),
   };

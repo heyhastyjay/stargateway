@@ -6,6 +6,7 @@ set -euo pipefail
 LAN_INTERFACE="${LAN_INTERFACE:-wlan0}"
 WAN_INTERFACE="${WAN_INTERFACE:-eth0}"
 PORTAL_IP="${PORTAL_IP:-10.0.0.1}"
+PORTAL_PORT="${PORTAL_PORT:-8080}"
 SSID="${SSID:-CampStarlink}"
 PASSPHRASE="${PASSPHRASE:-}"   # empty = open network (captive portal gates access)
 CHANNEL="${CHANNEL:-6}"
@@ -23,7 +24,8 @@ apt-get install -y hostapd dnsmasq iptables nftables dnsutils
 systemctl stop hostapd dnsmasq || true
 systemctl unmask hostapd || true
 
-# Static LAN address
+# Static LAN address (ifupdown; also set live below + hostapd ExecStartPre on NM images)
+mkdir -p /etc/network/interfaces.d
 cat >/etc/network/interfaces.d/starlink-paywall <<EOF
 allow-hotplug ${LAN_INTERFACE}
 iface ${LAN_INTERFACE} inet static
@@ -36,14 +38,16 @@ ip addr flush dev "${LAN_INTERFACE}" || true
 ip addr add "${PORTAL_IP}/24" dev "${LAN_INTERFACE}"
 ip link set "${LAN_INTERFACE}" up
 
-# DHCP + DNS hijack to portal for captive detection
+# DHCP + DNS for camp clients. Captive portal is nft DNAT of TCP 80/443
+# (not address=/#/portal — that wildcard wins over whitelist server=/ and
+# makes thephage.org and paid browsing resolve to the gateway).
 cat >/etc/dnsmasq.d/starlink-paywall.conf <<EOF
 interface=${LAN_INTERFACE}
 bind-interfaces
 dhcp-range=10.0.0.50,10.0.0.200,255.255.255.0,12h
 dhcp-option=3,${PORTAL_IP}
 dhcp-option=6,${PORTAL_IP}
-address=/#/${PORTAL_IP}
+dhcp-option=114,http://${PORTAL_IP}:${PORTAL_PORT}/.well-known/captive-portal
 EOF
 
 # hostapd
@@ -76,8 +80,9 @@ cat >/etc/default/hostapd <<EOF
 DAEMON_CONF="/etc/hostapd/hostapd.conf"
 EOF
 
-# Persist IP forwarding
-grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >>/etc/sysctl.conf
+# Persist IP forwarding (Trixie may have no /etc/sysctl.conf)
+mkdir -p /etc/sysctl.d
+echo 'net.ipv4.ip_forward=1' >/etc/sysctl.d/99-starlink-forward.conf
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

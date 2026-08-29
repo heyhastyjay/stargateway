@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" role="img" aria-label="Phage Camp">
+  <rect width="180" height="180" rx="40" fill="#0b1220"/>
+  <path fill="none" stroke="#3dd6c6" stroke-width="8" stroke-linecap="round" d="M52 78c10-22 66-22 76 0"/>
+  <path fill="none" stroke="#3dd6c6" stroke-width="8" stroke-linecap="round" d="M66 96c7-12 41-12 48 0"/>
+  <circle cx="90" cy="118" r="8" fill="#f0b429"/>
+</svg>

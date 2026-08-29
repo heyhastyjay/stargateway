@@ -25,11 +25,11 @@ import {
   sanitizePlayaName,
   searchEvents,
   countEvents,
-  GUEST_EVENT_LIMIT,
   SEARCH_EVENT_LIMIT,
   ADMIN_EVENT_LIMIT,
   QUICK_ACCESS_MINUTES,
   QUICK_ACCESS_COOLDOWN_MINUTES,
+  VIP_ACCESS_HOURS,
   quickAccessCooldownRemainingMs,
   sessionExpiryFromMinutes,
   sessionExpiryMs,
@@ -41,7 +41,6 @@ import {
   totalRaisedCents,
   updateSettings,
   upsertDevice,
-  listCampNames,
   searchCamps,
   getDeviceProfile,
   saveDeviceProfile,
@@ -64,19 +63,36 @@ import {
 } from "./stripe.js";
 import { syncSiteWhitelistNetwork } from "./site-whitelist.js";
 import { getWeatherRadarMap, getBrcWeather } from "./weather.js";
+import { fetchFiresmokePng, fetchFiresmokePngAt, getAirQuality, getWildfireHazards } from "./wildfire.js";
 import { IEM_TILE_BASE, sanitizeIemLayerId } from "./weather-radar-iem.js";
 import { librewxrUpstreamTileUrl } from "./weather-radar.js";
 import { pickMembersGateChallenge, verifyMembersGateAnswer } from "./members-gate.js";
+import { BMIR_MAX_LISTEN_MS, openBmirLiveStream } from "./bmir.js";
 import {
   adminDashboard,
   adminEventsPage,
   adminLoginPage,
-  guestEventsPage,
   guestPaywallPage,
   emergencyAccessPage,
   buildPayMethodLinks,
   successPage,
+  starlinkDataPage,
 } from "./views.js";
+import {
+  addStarlinkDataOperatorId,
+  bindStarlinkDataOperator,
+  DEFAULT_RESERVED_GB,
+  formatUpdatedAgo,
+  getStarlinkDataOperatorView,
+  getStarlinkDataStatus,
+  guestAccessBlockedByDataHold,
+  isStarlinkDataOperator,
+  parseGbInput,
+  setStarlinkDataRemaining,
+} from "./starlink-data.js";
+
+const GUEST_DATA_HOLD_MSG =
+  "Starlink data is held for Monday operations. Ask Jaybird if this is an emergency.";
 
 type Vars = { mac: string | null; admin: boolean; members: boolean };
 
@@ -96,6 +112,8 @@ const USER_AGENT = "(PhageCampStarlink/1.0; jaybird@phagecamp.local)";
 const CARTO_TILE = "https://a.basemaps.cartocdn.com/dark_all";
 const ESRI_SAT_TILE =
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile";
+const ESRI_ROADS_TILE =
+  "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile";
 
 const PUBLIC_MIME: Record<string, string> = {
   ".png": "image/png",
@@ -132,6 +150,24 @@ app.get("/playa-bg.jpg", (c) => servePublicFile(c, "playa-bg.jpg"));
 app.get("/icons/*", (c) => servePublicFile(c, c.req.path));
 app.get("/assets/*", (c) => servePublicFile(c, c.req.path));
 
+app.get("/manifest.webmanifest", (c) => {
+  const body = JSON.stringify({
+    name: "Phage Camp",
+    short_name: "Phage Camp",
+    description: "Camp Starlink portal — weather, BMIR, and emergency internet",
+    start_url: "/",
+    scope: "/",
+    display: "standalone",
+    background_color: "#0b1220",
+    theme_color: "#0b1220",
+    icons: [{ src: "/icons/app-icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }],
+  });
+  return c.body(body, 200, {
+    "Content-Type": "application/manifest+json",
+    "Cache-Control": "public, max-age=3600",
+  });
+});
+
 app.get("/vendor/leaflet/*", async (c) => {
   const rel = c.req.path.replace(/^\/vendor\/leaflet\/?/, "");
   if (!rel || rel.includes("..") || path.isAbsolute(rel)) {
@@ -161,17 +197,62 @@ app.get("/vendor/leaflet/*", async (c) => {
   }
 });
 
-app.get("/api/weather-radar", async (c) => {
-  return c.json(await getWeatherRadarMap(), 200, {
-    "Cache-Control": "private, max-age=90",
+app.get("/wx-overlay/firesmoke.png", async (c) => {
+  const png = await fetchFiresmokePng();
+  if (!png) return c.text("Smoke overlay unavailable", 502);
+  return c.body(Uint8Array.from(png.bytes), 200, {
+    "Content-Type": png.contentType,
+    "Cache-Control": "public, max-age=600",
   });
 });
+
+app.get("/wx-overlay/firesmoke/:file", async (c) => {
+  const file = c.req.param("file");
+  const match = /^(\d{12})\.png$/.exec(file);
+  if (!match) return c.text("Not found", 404);
+  const png = await fetchFiresmokePngAt(match[1]);
+  if (!png) return c.text("Smoke overlay unavailable", 502);
+  return c.body(Uint8Array.from(png.bytes), 200, {
+    "Content-Type": png.contentType,
+    "Cache-Control": "public, max-age=1800, immutable",
+  });
+});
+
+app.get("/api/weather-radar", async (c) => {
+  const radar = await getWeatherRadarMap();
+  const times = Array.isArray(radar.radar?.frames)
+    ? radar.radar.frames.map((f) => Number(f.time)).filter((t) => Number.isFinite(t) && t > 0)
+    : [];
+  const hazards = await getWildfireHazards(false, times);
+  return c.json(
+    { ...radar, hazards },
+    200,
+    { "Cache-Control": "private, max-age=90" },
+  );
+});
+
+const TILE_CACHE_MAX = 480;
+const tileCache = new Map<string, { bytes: Buffer; contentType: string; at: number }>();
+const TILE_CACHE_MS = 10 * 60 * 1000;
 
 async function proxyTile(
   c: Context,
   upstreamUrl: string,
+  cacheKey?: string,
+  cacheControl = "public, max-age=300",
 ): Promise<Response> {
   try {
+    if (cacheKey) {
+      const hit = tileCache.get(cacheKey);
+      if (hit && Date.now() - hit.at < TILE_CACHE_MS) {
+        tileCache.delete(cacheKey);
+        tileCache.set(cacheKey, hit);
+        return c.body(Uint8Array.from(hit.bytes), 200, {
+          "Content-Type": hit.contentType,
+          "Cache-Control": cacheControl,
+        });
+      }
+    }
     const res = await fetch(upstreamUrl, {
       headers: { "User-Agent": USER_AGENT, Accept: "image/png,image/*" },
       signal: AbortSignal.timeout(12_000),
@@ -180,9 +261,17 @@ async function proxyTile(
     const bytes = Buffer.from(await res.arrayBuffer());
     if (bytes.length < 20) return c.text("Tile empty", 502);
     const contentType = res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
-    return c.body(bytes, 200, {
+    if (cacheKey) {
+      tileCache.set(cacheKey, { bytes, contentType, at: Date.now() });
+      while (tileCache.size > TILE_CACHE_MAX) {
+        const oldest = tileCache.keys().next().value;
+        if (oldest == null) break;
+        tileCache.delete(oldest);
+      }
+    }
+    return c.body(Uint8Array.from(bytes), 200, {
       "Content-Type": contentType,
-      "Cache-Control": "public, max-age=300",
+      "Cache-Control": cacheControl,
     });
   } catch {
     return c.text("Tile unavailable", 502);
@@ -210,6 +299,18 @@ app.get("/wx-tiles/sat/:z/:x/:y", async (c) => {
     return c.text("Bad tile", 400);
   }
   return proxyTile(c, `${ESRI_SAT_TILE}/${z}/${yi}/${x}`);
+});
+
+/** Esri World Transportation — road overlay (transparent PNG, z/y/x). */
+app.get("/wx-tiles/roads/:z/:x/:y", async (c) => {
+  const z = Number(c.req.param("z"));
+  const x = Number(c.req.param("x"));
+  const yRaw = String(c.req.param("y") ?? "").replace(/\.(png|jpg|jpeg)$/i, "");
+  const yi = Number(yRaw);
+  if (![z, x, yi].every((n) => Number.isInteger(n) && n >= 0) || z > 18) {
+    return c.text("Bad tile", 400);
+  }
+  return proxyTile(c, `${ESRI_ROADS_TILE}/${z}/${yi}/${x}`);
 });
 
 app.get("/wx-tiles/iem/:layer/:z/:x/:y", async (c) => {
@@ -243,7 +344,12 @@ app.get("/wx-tiles/radar/:time/:size/:z/:x/:y", async (c) => {
   ) {
     return c.text("Bad tile", 400);
   }
-  return proxyTile(c, librewxrUpstreamTileUrl(time, z, x, yi));
+  return proxyTile(
+    c,
+    librewxrUpstreamTileUrl(time, z, x, yi),
+    `radar:${time}:${z}:${x}:${yi}`,
+    "public, max-age=1800, immutable",
+  );
 });
 
 async function resolveClientMac(c: Parameters<typeof getConnInfo>[0]): Promise<string | null> {
@@ -285,46 +391,112 @@ function requireAdmin() {
   });
 }
 
-/** Captive portal connectivity checks — respond so OS detects portal. */
-app.get("/generate_204", (c) => c.body(null, 204));
-app.get("/gen_204", (c) => c.body(null, 204));
-app.get("/hotspot-detect.html", (c) =>
-  c.html("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"),
+function hasInternet(c: Context<{ Variables: Vars }>): boolean {
+  const mac = c.get("mac");
+  if (!mac) return false;
+  return isDeviceCurrentlyAllowed(getDevice(mac));
+}
+
+const CAPTIVE_NO_STORE = { "Cache-Control": "no-store" };
+
+/** Send unpaid phones to the landing page so the OS captive sheet opens. */
+function captivePortalRedirect(c: Context<{ Variables: Vars }>) {
+  const dest = config.firewallEnabled ? `${config.publicUrl}/` : "/";
+  return c.redirect(dest, 302);
+}
+
+/**
+ * OS captive probes (iOS captive.apple.com, Android generate_204, Windows NCSI).
+ * Success answers mean “this network is online” and the Sign-in sheet never appears.
+ * Unpaid devices must fail the probe so the phone opens the landing page.
+ */
+app.get("/generate_204", (c) =>
+  hasInternet(c) ? c.body(null, 204) : captivePortalRedirect(c),
 );
-app.get("/library/test/success.html", (c) => c.text("Success"));
-app.get("/ncsi.txt", (c) => c.text("Microsoft NCSI"));
-app.get("/connecttest.txt", (c) => c.text("Microsoft Connect Test"));
-app.get("/canonical.html", (c) => c.html("<html><head><title>Success</title></head></html>"));
+app.get("/gen_204", (c) =>
+  hasInternet(c) ? c.body(null, 204) : captivePortalRedirect(c),
+);
+app.get("/hotspot-detect.html", (c) =>
+  hasInternet(c)
+    ? c.html("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>", 200, CAPTIVE_NO_STORE)
+    : captivePortalRedirect(c),
+);
+app.get("/library/test/success.html", (c) =>
+  hasInternet(c) ? c.text("Success", 200, CAPTIVE_NO_STORE) : captivePortalRedirect(c),
+);
+app.get("/ncsi.txt", (c) =>
+  hasInternet(c) ? c.text("Microsoft NCSI", 200, CAPTIVE_NO_STORE) : captivePortalRedirect(c),
+);
+app.get("/connecttest.txt", (c) =>
+  hasInternet(c)
+    ? c.text("Microsoft Connect Test", 200, CAPTIVE_NO_STORE)
+    : captivePortalRedirect(c),
+);
+app.get("/canonical.html", (c) =>
+  hasInternet(c)
+    ? c.html("<html><head><title>Success</title></head></html>", 200, CAPTIVE_NO_STORE)
+    : captivePortalRedirect(c),
+);
+
+/** RFC 8908 — advertised via DHCP option 114. */
+app.get("/.well-known/captive-portal", (c) => {
+  const captive = !hasInternet(c);
+  return c.body(
+    JSON.stringify({
+      captive,
+      "user-portal-url": `${config.publicUrl}/`,
+      "venue-info-url": `${config.publicUrl}/`,
+    }),
+    200,
+    { ...CAPTIVE_NO_STORE, "Content-Type": "application/captive+json" },
+  );
+});
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/events", (c) => {
-  const mac = c.get("mac");
-  const device = mac ? getDevice(mac) : null;
-  const profile = mac ? getDeviceProfile(mac) : null;
-  const state = profile?.state ?? EMPTY_EVENTS_PROFILE;
-  const query = String(c.req.query("q") ?? state.q ?? "");
-  const camp = String(c.req.query("camp") ?? state.camp ?? "");
-  const limit = query.trim() || camp.trim() ? SEARCH_EVENT_LIMIT : GUEST_EVENT_LIMIT;
-  const events = searchEvents(query, limit, camp);
-  const total = countEvents(query, camp);
-  const playaName = sanitizePlayaName(device?.playa_name ?? "");
-  return c.html(
-    guestEventsPage({
-      query,
-      camp,
-      campQ: state.campQ,
-      events,
-      total,
-      limit,
-      mac,
-      playaName,
-      profile: state,
-      profileUpdatedAt: profile?.updated_at ?? null,
-      camps: listCampNames(),
-    }),
-  );
+/** Same-origin BMIR Icecast proxy so the gateway player works for unpaid devices. */
+app.get("/bmir/stream", async (c) => {
+  const env = c.env as {
+    incoming?: { setTimeout?: (ms: number) => void };
+    outgoing?: { setTimeout?: (ms: number) => void };
+  };
+  env.incoming?.setTimeout?.(0);
+  env.outgoing?.setTimeout?.(0);
+
+  const session = new AbortController();
+  const hourTimer = setTimeout(() => session.abort(), BMIR_MAX_LISTEN_MS);
+  const stopHour = () => clearTimeout(hourTimer);
+  const onClientAbort = () => {
+    stopHour();
+    session.abort();
+  };
+  c.req.raw.signal.addEventListener("abort", onClientAbort, { once: true });
+
+  let upstream: Awaited<ReturnType<typeof openBmirLiveStream>> = null;
+  try {
+    upstream = await openBmirLiveStream(session.signal);
+  } catch {
+    stopHour();
+    return c.text("BMIR is off the air", 503, { "Cache-Control": "no-store" });
+  }
+  if (!upstream?.body) {
+    stopHour();
+    return c.text("BMIR is off the air", 503, { "Cache-Control": "no-store" });
+  }
+  const type = upstream.headers.get("content-type") || "audio/mpeg";
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "Content-Type": type,
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      Pragma: "no-cache",
+      "Accept-Ranges": "none",
+      "X-Accel-Buffering": "no",
+    },
+  });
 });
+
+app.get("/events", (c) => c.redirect("/"));
 
 app.get("/api/events", (c) => {
   const query = String(c.req.query("q") ?? "");
@@ -433,7 +605,7 @@ app.get("/", async (c) => {
   const device = mac ? getDevice(mac) : null;
   const allowed = isDeviceCurrentlyAllowed(device);
   const settings = getSettings();
-  const weather = await getBrcWeather();
+  const [weather, air] = await Promise.all([getBrcWeather(), getAirQuality()]);
   const playaName = sanitizePlayaName(device?.playa_name || "");
   return c.html(
     guestPaywallPage({
@@ -442,10 +614,14 @@ app.get("/", async (c) => {
       allowed,
       paidUntil: device?.paid_until ?? null,
       weather,
+      air,
       playaName,
       askPlayaName: Boolean(mac && !playaName),
       canceled: c.req.query("canceled") === "1",
       error: c.req.query("error") ?? undefined,
+      starlinkData: getStarlinkDataOperatorView(mac, c.get("admin")),
+      dataFlash: c.req.query("data") === "saved" ? "Remaining data updated." : undefined,
+      dataError: c.req.query("data_error") ?? undefined,
     }),
   );
 });
@@ -460,6 +636,7 @@ app.get("/access", async (c) => {
   const methods = await buildPayMethodLinks(settings, mac ?? "unknown");
   const draft = mac ? getAccessDraft(mac) : null;
   const playaName = sanitizePlayaName(device?.playa_name || draft?.playa_name || "");
+  const starlinkData = getStarlinkDataStatus();
   return c.html(
     emergencyAccessPage({
       settings,
@@ -478,6 +655,8 @@ app.get("/access", async (c) => {
       membersUnlocked: c.get("members"),
       membersGateChallenge: pickMembersGateChallenge(),
       error: c.req.query("error") ?? undefined,
+      guestHoldActive: guestAccessBlockedByDataHold(mac, c.get("admin")),
+      reservedGb: starlinkData.reserved_gb,
     }),
   );
 });
@@ -576,6 +755,9 @@ app.get("/quick", async (c) => {
 app.post("/quick", async (c) => {
   const body = await c.req.parseBody();
   const macRaw = String(body.mac || c.get("mac") || "");
+  if (guestAccessBlockedByDataHold(macRaw || c.get("mac"), c.get("admin"))) {
+    return c.redirect(`/access?error=${encodeURIComponent(GUEST_DATA_HOLD_MSG)}`);
+  }
   if (!macRaw) {
     return c.redirect(`/access?error=${encodeURIComponent("Unknown device — reconnect to Wi‑Fi.")}`);
   }
@@ -636,6 +818,9 @@ app.post("/reset-access", async (c) => {
 app.post("/pay/stripe", async (c) => {
   const body = await c.req.parseBody();
   const macRaw = String(body.mac || c.get("mac") || "");
+  if (guestAccessBlockedByDataHold(macRaw || c.get("mac"), c.get("admin"))) {
+    return c.redirect(`/?error=${encodeURIComponent(GUEST_DATA_HOLD_MSG)}`);
+  }
   const playa = sanitizePlayaName(String(body.playa_name || ""));
   if (!macRaw) return c.redirect("/?error=Unknown%20device");
   if (!playa) return c.redirect("/?error=Playa%20name%20required");
@@ -682,6 +867,10 @@ app.post("/pay/manual", async (c) => {
     return c.redirect("/access?error=Members%20only%20%E2%80%94%20unlock%20first");
   }
   const body = await c.req.parseBody();
+  const holdMac = String(body.mac || c.get("mac") || "");
+  if (guestAccessBlockedByDataHold(holdMac || c.get("mac"), c.get("admin"))) {
+    return c.redirect(`/access?error=${encodeURIComponent(GUEST_DATA_HOLD_MSG)}`);
+  }
   const amountRaw = String(body.amount_cents || "");
   const amountCents =
     amountRaw === "custom"
@@ -709,8 +898,8 @@ app.post("/pay/manual", async (c) => {
   const existing = getDevice(mac);
   const playa =
     sanitizePlayaName(existing?.playa_name || "") ||
-    sanitizePlayaName(String(body.playa_name || ""));
-  if (!playa) return c.redirect("/access?error=Burner%20name%20required");
+    sanitizePlayaName(String(body.playa_name || "")) ||
+    "member";
 
   if (method !== "gift" && method !== "cash") {
     const settings = getSettings();
@@ -731,7 +920,7 @@ app.post("/pay/manual", async (c) => {
   // Honor system: unlock immediately — no admin payment verification.
   const device = upsertDevice(mac, {
     status: "allowed",
-    paid_until: null,
+    paid_until: sessionExpiryMs(VIP_ACCESS_HOURS),
     payment_method: method,
     playa_name: playa,
   });
@@ -744,13 +933,112 @@ app.post("/pay/manual", async (c) => {
     playa_name: playa,
   });
   await grantAccess(device);
+  return c.redirect("https://thephage.org/public/");
+});
+
+function starlinkDataReturnTo(c: Context<{ Variables: Vars }>): string {
+  const referer = c.req.header("referer");
+  if (referer) {
+    try {
+      const path = new URL(referer).pathname;
+      if (path === "/" || path === "/data" || path === "/admin") return path;
+    } catch {
+      /* ignore */
+    }
+  }
+  return "/data";
+}
+
+function starlinkDataDenied(c: Context<{ Variables: Vars }>, dest: string) {
+  const q = new URLSearchParams({ data_error: "This device is not authorized to update remaining data." });
+  return c.redirect(`${dest}?${q.toString()}`);
+}
+
+app.get("/api/starlink-data", (c) => {
+  const status = getStarlinkDataStatus();
+  return c.json(
+    {
+      ...status,
+      updated_label: formatUpdatedAgo(status.updated_at),
+    },
+    200,
+    { "Cache-Control": "private, max-age=15" },
+  );
+});
+
+app.get("/data", (c) => {
+  const mac = c.get("mac");
   return c.html(
-    successPage({
-      ok: true,
-      mac,
-      message: "You're online. Thanks for supporting camp — payment is optional and on the honor system.",
+    starlinkDataPage({
+      view: getStarlinkDataOperatorView(mac, c.get("admin")),
+      flash: c.req.query("flash") ?? undefined,
+      error: c.req.query("error") ?? undefined,
     }),
   );
+});
+
+app.post("/data/bind", async (c) => {
+  const mac = c.get("mac");
+  if (!mac) {
+    return c.redirect("/data?error=Unknown%20device%20%E2%80%94%20reconnect%20to%20Wi-Fi.");
+  }
+  const body = await c.req.parseBody();
+  try {
+    bindStarlinkDataOperator(mac, String(body.unique_id || ""));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Could not authorize this device";
+    return c.redirect(`/data?error=${encodeURIComponent(msg)}`);
+  }
+  return c.redirect("/data?flash=Device%20authorized.%20You%20can%20set%20remaining%20data.");
+});
+
+app.post("/data/remaining", async (c) => {
+  const dest = starlinkDataReturnTo(c);
+  const mac = c.get("mac");
+  if (!isStarlinkDataOperator(mac, c.get("admin"))) {
+    return starlinkDataDenied(c, dest === "/admin" ? "/data" : dest);
+  }
+  const body = await c.req.parseBody();
+  const remaining = parseGbInput(String(body.remaining_gb || ""));
+  if (remaining == null) {
+    const q = dest === "/data" ? "error" : "data_error";
+    return c.redirect(`${dest}?${q}=${encodeURIComponent("Enter remaining GB (0–10000).")}`);
+  }
+  const limitRaw = String(body.limit_gb || "").trim();
+  const limitGb = limitRaw === "" ? null : parseGbInput(limitRaw);
+  if (limitRaw && limitGb == null) {
+    const q = dest === "/data" ? "error" : "data_error";
+    return c.redirect(`${dest}?${q}=${encodeURIComponent("Plan size must be a number of GB.")}`);
+  }
+  const reservedRaw = String(body.reserved_gb || "").trim();
+  const reservedGb = reservedRaw === "" ? DEFAULT_RESERVED_GB : parseGbInput(reservedRaw);
+  if (reservedGb == null) {
+    const q = dest === "/data" ? "error" : "data_error";
+    return c.redirect(`${dest}?${q}=${encodeURIComponent("Hold GB must be 0–10000 (0 = no hold).")}`);
+  }
+  setStarlinkDataRemaining({ remainingGb: remaining, limitGb, reservedGb });
+  if (dest === "/") return c.redirect("/?data=saved");
+  if (dest === "/admin") return c.redirect("/admin?flash=Remaining%20data%20updated");
+  return c.redirect("/data?flash=Remaining%20data%20updated");
+});
+
+app.post("/data/operators", async (c) => {
+  const dest = starlinkDataReturnTo(c);
+  const mac = c.get("mac");
+  if (!isStarlinkDataOperator(mac, c.get("admin"))) {
+    return starlinkDataDenied(c, dest === "/admin" ? "/data" : dest);
+  }
+  const body = await c.req.parseBody();
+  try {
+    const added = addStarlinkDataOperatorId(String(body.unique_id || ""));
+    const msg = `Added ${added}`;
+    if (dest === "/admin") return c.redirect(`/admin?flash=${encodeURIComponent(msg)}`);
+    return c.redirect(`/data?flash=${encodeURIComponent(msg)}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Invalid unique ID";
+    if (dest === "/admin") return c.redirect(`/admin?flash=${encodeURIComponent(msg)}`);
+    return c.redirect(`/data?error=${encodeURIComponent(msg)}`);
+  }
 });
 
 app.get("/admin/login", (c) => {
@@ -793,6 +1081,7 @@ app.get("/admin", requireAdmin(), (c) => {
       payments: listPayments(),
       siteWhitelist: listSiteWhitelist(),
       flash: c.req.query("flash") ?? undefined,
+      starlinkData: getStarlinkDataOperatorView(c.get("mac"), true),
     }),
   );
 });

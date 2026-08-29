@@ -5,7 +5,15 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { config } from "./config.js";
 import { listApprovedSiteHostnames } from "./db.js";
-import { ensureAllowedDestsSupport, syncAllowedDestIps } from "./firewall.js";
+import { ensureAllowedDestsSupport, syncAllowedDestIps, syncBlockedDestIps } from "./firewall.js";
+import {
+  PERMANENT_BLOCKLIST_IPV4_CIDRS,
+  PERMANENT_BLOCKLIST_IPV6_CIDRS,
+  isPermanentlyBlockedHostname,
+  isSharedGoogleFrontendIp,
+  permanentBlocklistDnsmasqHostnames,
+  permanentBlocklistResolveHostnames,
+} from "./permanent-blocklist.js";
 import {
   permanentWhitelistDnsmasqHostnames,
   permanentWhitelistResolveHostnames,
@@ -17,14 +25,22 @@ function dnsmasqConfPath(): string {
   return config.dnsmasqWhitelistConf;
 }
 
+function dnsmasqBlockConfPath(): string {
+  return config.dnsmasqBlocklistConf;
+}
+
 function dataDirConfPath(): string {
   return path.join(config.dataDir, "dnsmasq-site-whitelist.conf");
+}
+
+function dataDirBlockConfPath(): string {
+  return path.join(config.dataDir, "dnsmasq-site-block.conf");
 }
 
 function buildDnsmasqSnippet(hostnames: string[]): string {
   const lines = [
     "# Managed by starlinkpayment — do not edit by hand",
-    "# Real upstream DNS for permanent + crowd-approved sites (overrides address=/#/ portal hijack)",
+    "# Real upstream DNS for permanent + crowd-approved sites.",
   ];
   const dns = config.whitelistUpstreamDns;
   for (const host of hostnames) {
@@ -56,8 +72,8 @@ async function resolveHostIps(hostname: string): Promise<string[]> {
 
 async function reloadDnsmasq(): Promise<void> {
   try {
-    await execFileAsync("systemctl", ["reload", "dnsmasq"], { timeout: 10_000 });
-    console.log("[site-whitelist] reloaded dnsmasq");
+    await execFileAsync("systemctl", ["restart", "dnsmasq"], { timeout: 10_000 });
+    console.log("[site-whitelist] restarted dnsmasq");
     return;
   } catch {
     /* try kill -HUP */
@@ -75,6 +91,34 @@ async function reloadDnsmasq(): Promise<void> {
   }
 }
 
+function buildDnsmasqBlockSnippet(hostnames: string[]): string {
+  const lines = [
+    "# Managed by starlinkpayment — do not edit by hand",
+    "# Always-on block: TikTok, Reddit, Google News, major news (all devices). Overrides whitelist server=/",
+  ];
+  for (const host of hostnames) {
+    lines.push(`address=/${host}/0.0.0.0`);
+  }
+  if (hostnames.length === 0) {
+    lines.push("# (no blocked sites)");
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function writeConfIfChanged(dest: string, snippet: string): { wrote: boolean; changed: boolean } {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  let prev = "";
+  try {
+    prev = fs.readFileSync(dest, "utf8");
+  } catch {
+    /* first write */
+  }
+  if (prev === snippet) return { wrote: true, changed: false };
+  fs.writeFileSync(dest, snippet, "utf8");
+  return { wrote: true, changed: true };
+}
+
 function mergeHostnames(...lists: string[][]): string[] {
   const set = new Set<string>();
   for (const list of lists) {
@@ -85,27 +129,31 @@ function mergeHostnames(...lists: string[][]): string[] {
 
 /** Write dnsmasq exceptions + nftables destination allowlist for approved hostnames. */
 export async function syncSiteWhitelistNetwork(): Promise<void> {
-  const crowdHostnames = listApprovedSiteHostnames();
+  const crowdHostnames = listApprovedSiteHostnames().filter((h) => !isPermanentlyBlockedHostname(h));
   const permanentDns = permanentWhitelistDnsmasqHostnames();
+  const blockedDns = permanentBlocklistDnsmasqHostnames();
   const dnsmasqHosts = mergeHostnames(permanentDns, crowdHostnames);
   const snippet = buildDnsmasqSnippet(dnsmasqHosts);
+  const blockSnippet = buildDnsmasqBlockSnippet(blockedDns);
 
   fs.mkdirSync(config.dataDir, { recursive: true });
   fs.writeFileSync(dataDirConfPath(), snippet, "utf8");
+  fs.writeFileSync(dataDirBlockConfPath(), blockSnippet, "utf8");
 
   let wroteSystemConf = false;
+  let dnsmasqChanged = false;
   try {
-    const dest = dnsmasqConfPath();
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.writeFileSync(dest, snippet, "utf8");
-    wroteSystemConf = true;
+    const white = writeConfIfChanged(dnsmasqConfPath(), snippet);
+    const block = writeConfIfChanged(dnsmasqBlockConfPath(), blockSnippet);
+    wroteSystemConf = white.wrote && block.wrote;
+    dnsmasqChanged = white.changed || block.changed;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[site-whitelist] could not write ${dnsmasqConfPath()}: ${msg}`);
-    console.warn(`[site-whitelist] copy kept at ${dataDirConfPath()}`);
+    console.warn(`[site-whitelist] could not write dnsmasq conf: ${msg}`);
+    console.warn(`[site-whitelist] copies kept at ${dataDirConfPath()} and ${dataDirBlockConfPath()}`);
   }
 
-  if (wroteSystemConf && config.firewallEnabled) {
+  if (wroteSystemConf && config.firewallEnabled && dnsmasqChanged) {
     await reloadDnsmasq();
   }
 
@@ -119,9 +167,26 @@ export async function syncSiteWhitelistNetwork(): Promise<void> {
     }
   }
   await syncAllowedDestIps([...allIps]);
+
+  const blockedResolved = new Set<string>();
+  const resolvedLists = await Promise.all(
+    permanentBlocklistResolveHostnames().map((host) => resolveHostIps(host)),
+  );
+  for (const ips of resolvedLists) {
+    for (const ip of ips) {
+      if (!allIps.has(ip) && !isSharedGoogleFrontendIp(ip)) blockedResolved.add(ip);
+    }
+  }
+  await syncBlockedDestIps(
+    [...PERMANENT_BLOCKLIST_IPV4_CIDRS, ...blockedResolved],
+    [...PERMANENT_BLOCKLIST_IPV6_CIDRS],
+  );
+
   console.log(
     `[site-whitelist] synced ${dnsmasqHosts.length} hostname(s) ` +
       `(${permanentDns.length} permanent, ${crowdHostnames.length} crowd), ` +
-      `${allIps.size} IPv4 destination(s)`,
+      `${allIps.size} IPv4 destination(s); ` +
+      `blocked ${blockedDns.length} domain(s), ` +
+      `${PERMANENT_BLOCKLIST_IPV4_CIDRS.length} cidr(s) + ${blockedResolved.size} resolved ip(s)`,
   );
 }

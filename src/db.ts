@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { config } from "./config.js";
+import { isPermanentlyBlockedHostname } from "./permanent-blocklist.js";
 
 export type DeviceStatus = "blocked" | "pending" | "allowed" | "revoked";
 
@@ -331,8 +332,8 @@ export const DONATION_TIERS: ReadonlyArray<{ cents: number; label: string }> = [
       "$20 - I'm a workaholic, instead of taking days off, I'm making money out here.",
   },
   {
-    cents: 4000,
-    label: "$40 - I want to scroll the internetz all the timeeee. Whatevarrr~~~ Default Lyfe 🤘",
+    cents: 3000,
+    label: "$30 - I want to scroll the internetz all the timeeee. Whatevarrr~~~ Default Lyfe 🤘",
   },
 ];
 
@@ -631,10 +632,12 @@ export function sessionExpiryMs(hours = getSettings().session_hours): number {
   return Date.now() + hours * 60 * 60 * 1000;
 }
 
-/** Short guest unlock (e.g. “just need it for 5 seconds”). */
-export const QUICK_ACCESS_MINUTES = 5;
-/** After a quick unlock ends, this MAC cannot request another until this cool-down elapses. */
-export const QUICK_ACCESS_COOLDOWN_MINUTES = 10;
+/** Short visitor unlock. */
+export const QUICK_ACCESS_MINUTES = 10;
+/** After a visitor unlock ends, this MAC cannot request another until this cool-down elapses. */
+export const QUICK_ACCESS_COOLDOWN_MINUTES = 20;
+/** Phage VIP unlock. After this they are kicked off with no cool-down; they can click in again. */
+export const VIP_ACCESS_HOURS = 3;
 
 export function sessionExpiryFromMinutes(minutes: number): number {
   return Date.now() + minutes * 60 * 1000;
@@ -1286,6 +1289,9 @@ export type SiteWhitelistRequestResult = {
 /** Record a MAC vote for an exact URL; auto-approves at SITE_WHITELIST_VOTES_NEEDED unique MACs. */
 export function requestSiteWhitelist(rawUrl: string, mac: string): SiteWhitelistRequestResult {
   const { url, hostname } = normalizeWhitelistUrl(rawUrl);
+  if (isPermanentlyBlockedHostname(hostname)) {
+    throw new Error("That site is blocked on this network");
+  }
   const key = normalizeMac(mac);
   const now = Date.now();
   const db = getDb();

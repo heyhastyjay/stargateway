@@ -4,12 +4,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
 import { getDb, isDeviceCurrentlyAllowed, listDevices, upsertDevice, type Device } from "./db.js";
+import {
+  PERMANENT_BLOCKLIST_IPV4_CIDRS,
+  PERMANENT_BLOCKLIST_IPV6_CIDRS,
+} from "./permanent-blocklist.js";
 
 const execFileAsync = promisify(execFile);
 
 const TABLE = "starlink_paywall";
 const SET_ALLOWED = "allowed_macs";
 const SET_DESTS = "allowed_dests";
+const SET_BLOCKED = "blocked_dests";
+const SET_BLOCKED6 = "blocked_dests6";
 
 export async function runNft(args: string[]): Promise<string> {
   const { stdout, stderr } = await execFileAsync("nft", args, {
@@ -47,6 +53,11 @@ export async function ensureFirewall(): Promise<void> {
 
   await syncAllowlistFromDb();
   await ensureAllowedDestsSupport();
+  await ensureBlockedDestsSupport();
+  await syncBlockedDestIps(
+    [...PERMANENT_BLOCKLIST_IPV4_CIDRS],
+    [...PERMANENT_BLOCKLIST_IPV6_CIDRS],
+  );
 }
 
 function buildNftBootstrap(): string {
@@ -60,6 +71,16 @@ table inet ${TABLE} {
 
   set ${SET_DESTS} {
     type ipv4_addr
+    flags interval
+  }
+
+  set ${SET_BLOCKED} {
+    type ipv4_addr
+    flags interval
+  }
+
+  set ${SET_BLOCKED6} {
+    type ipv6_addr
     flags interval
   }
 
@@ -80,6 +101,8 @@ table inet ${TABLE} {
 
   chain forward {
     type filter hook forward priority filter; policy drop;
+    ip daddr @${SET_BLOCKED} drop
+    ip6 daddr @${SET_BLOCKED6} drop
     ct state established,related accept
     iifname "${lanInterface}" oifname "${wanInterface}" ether saddr @${SET_ALLOWED} accept
     iifname "${lanInterface}" oifname "${wanInterface}" ip daddr @${SET_DESTS} accept
@@ -176,7 +199,135 @@ export async function ensureAllowedDestsSupport(): Promise<void> {
   }
 }
 
-/** Replace destination IP allowlist used for unpaid access to crowd-approved sites. */
+/** Ensure blocked_dests sets + drop-before-allow rules exist on older tables. */
+export async function ensureBlockedDestsSupport(): Promise<void> {
+  if (!config.firewallEnabled) return;
+
+  try {
+    await runNft(["list", "set", "inet", TABLE, SET_BLOCKED]);
+  } catch {
+    const ok = await nftQuiet([
+      "add",
+      "set",
+      "inet",
+      TABLE,
+      SET_BLOCKED,
+      "{",
+      "type",
+      "ipv4_addr",
+      ";",
+      "flags",
+      "interval",
+      ";",
+      "}",
+    ]);
+    if (ok) console.log(`[firewall] created set ${SET_BLOCKED}`);
+  }
+
+  try {
+    await runNft(["list", "set", "inet", TABLE, SET_BLOCKED6]);
+  } catch {
+    const ok = await nftQuiet([
+      "add",
+      "set",
+      "inet",
+      TABLE,
+      SET_BLOCKED6,
+      "{",
+      "type",
+      "ipv6_addr",
+      ";",
+      "flags",
+      "interval",
+      ";",
+      "}",
+    ]);
+    if (ok) console.log(`[firewall] created set ${SET_BLOCKED6}`);
+  }
+
+  let chain = "";
+  try {
+    chain = await runNft(["list", "chain", "inet", TABLE, "forward"]);
+  } catch {
+    return;
+  }
+  // insert puts the rule first so drops beat established/related and allowed MACs.
+  if (!chain.includes(`@${SET_BLOCKED}`)) {
+    await nftQuiet([
+      "insert",
+      "rule",
+      "inet",
+      TABLE,
+      "forward",
+      "ip",
+      "daddr",
+      `@${SET_BLOCKED}`,
+      "drop",
+    ]);
+  }
+  if (!chain.includes(`@${SET_BLOCKED6}`)) {
+    await nftQuiet([
+      "insert",
+      "rule",
+      "inet",
+      TABLE,
+      "forward",
+      "ip6",
+      "daddr",
+      `@${SET_BLOCKED6}`,
+      "drop",
+    ]);
+  }
+}
+
+function isIpv4Prefix(value: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(value);
+}
+
+function isIpv6Prefix(value: string): boolean {
+  return /^[0-9a-f:]+(\/\d{1,3})?$/i.test(value) && value.includes(":");
+}
+
+/**
+ * Add always-blocked destinations (CIDRs or hosts). Never flush — stale TikTok
+ * IPs staying blocked is fine; removing them would briefly reopen the app.
+ */
+export async function syncBlockedDestIps(ipv4: string[], ipv6: string[] = []): Promise<void> {
+  if (!config.firewallEnabled) {
+    console.log(
+      `[firewall] dry-run blocked_dests (${ipv4.length} ipv4, ${ipv6.length} ipv6)`,
+    );
+    return;
+  }
+
+  await ensureBlockedDestsSupport();
+
+  for (const cidr of ipv4) {
+    if (!isIpv4Prefix(cidr)) continue;
+    try {
+      await runNft(["add", "element", "inet", TABLE, SET_BLOCKED, "{", cidr, "}"]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/exists|File exists/i.test(msg)) {
+        console.warn(`[firewall] block dest ${cidr}:`, msg);
+      }
+    }
+  }
+
+  for (const cidr of ipv6) {
+    if (!isIpv6Prefix(cidr)) continue;
+    try {
+      await runNft(["add", "element", "inet", TABLE, SET_BLOCKED6, "{", cidr, "}"]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/exists|File exists/i.test(msg)) {
+        console.warn(`[firewall] block dest6 ${cidr}:`, msg);
+      }
+    }
+  }
+}
+
+/** Add destination IPs for unpaid whitelist access. Never flush — live streams must not drop. */
 export async function syncAllowedDestIps(ips: string[]): Promise<void> {
   if (!config.firewallEnabled) {
     console.log(`[firewall] dry-run allowed_dests (${ips.length} ip(s))`);
@@ -184,13 +335,6 @@ export async function syncAllowedDestIps(ips: string[]): Promise<void> {
   }
 
   await ensureAllowedDestsSupport();
-
-  try {
-    await runNft(["flush", "set", "inet", TABLE, SET_DESTS]);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[firewall] flush ${SET_DESTS}:`, msg);
-  }
 
   for (const ip of ips) {
     if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) continue;
@@ -299,6 +443,7 @@ export function expireStaleDevices(): number {
 
   for (const row of stale) {
     upsertDevice(row.mac, { status: "revoked", paid_until: now });
+    // MAC only — do not touch allowed_dests / whitelist (DJ streams).
     void revokeMac(row.mac);
   }
   return stale.length;

@@ -73,6 +73,14 @@ export function gateAnswersMatch(given: string, expected: string): boolean {
   return false;
 }
 
+/** Map common misspellings of the current burn-night chef first name. */
+function canonicalizeChefName(raw: string): string {
+  return normalizeGateAnswer(raw)
+    .split(" ")
+    .map((tok) => (tok === "laden" ? "ladan" : tok))
+    .join(" ");
+}
+
 /** Cloudberry + common misspellings / spacing (cloud berry, cloudbarry, …). */
 export function matchesCloudberry(given: string): boolean {
   let n = normalizeGateAnswerLoose(given);
@@ -248,7 +256,7 @@ export async function getMembersGateExpectedAnswer(): Promise<string> {
 
 async function verifyBurnNightChef(given: string): Promise<boolean> {
   const expected = await getMembersGateExpectedAnswer();
-  return gateAnswersMatch(given, expected);
+  return gateAnswersMatch(canonicalizeChefName(given), canonicalizeChefName(expected));
 }
 
 /**

@@ -24,11 +24,25 @@ import {
   WEATHER_SITE_LABEL,
   classifyWeatherIcon,
   formatFullMoonDayLabel,
+  getWeatherCenter,
   MOON_PHASE_LABELS,
   moonPhaseIndex8,
   type BrcAstro,
   type BrcWeather,
 } from "./weather.js";
+import {
+  aqiBannerColor,
+  aqiCategory,
+  watchDutyMapUrl,
+  type AirQuality,
+} from "./wildfire.js";
+import { BMIR_DIRECT_STREAM, BMIR_MAX_LISTEN_MS, BMIR_STREAM_PATH } from "./bmir.js";
+import {
+  DEFAULT_RESERVED_GB,
+  formatGb,
+  formatUpdatedAgo,
+  type StarlinkDataOperatorView,
+} from "./starlink-data.js";
 
 function escapeHtml(s: string): string {
   return s
@@ -73,7 +87,25 @@ function polylinePoints(
   return values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(" ");
 }
 
-function formatAstroTime(isoLocal: string | null): string {
+function addCalendarDays(dateKey: string, days: number): string {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  if (!y || !m || !d) return dateKey;
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
+
+function astroDayHint(isoLocal: string, todayKey: string): string | null {
+  const eventDate = isoLocal.slice(0, 10);
+  if (!eventDate || eventDate === todayKey) return null;
+  if (eventDate === addCalendarDays(todayKey, 1)) return "tomorrow";
+  const [y, m, d] = eventDate.split("-").map(Number);
+  if (!y || !m || !d) return eventDate;
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-US", {
+    weekday: "short",
+    timeZone: "UTC",
+  });
+}
+
+function formatAstroClock(isoLocal: string | null): string {
   if (!isoLocal) return "—";
   const hour = Number(isoLocal.slice(11, 13));
   const minute = isoLocal.slice(14, 16);
@@ -81,6 +113,13 @@ function formatAstroTime(isoLocal: string | null): string {
   const h12 = hour % 12 || 12;
   const ampm = hour < 12 ? "AM" : "PM";
   return `${h12}:${minute} ${ampm}`;
+}
+
+function renderAstroTime(isoLocal: string | null, todayKey: string): string {
+  const time = formatAstroClock(isoLocal);
+  const hint = isoLocal ? astroDayHint(isoLocal, todayKey) : null;
+  const day = hint ? `<span class="wx-astro-day">${escapeHtml(hint)}</span>` : "";
+  return `<span class="wx-astro-time">${time}</span>${day}`;
 }
 
 function renderWeatherConditionIcon(code: number): string {
@@ -102,11 +141,11 @@ function renderAstroRow(astro: BrcAstro | null, fullMoonDate: string | null = nu
         <div class="wx-astro-pair">
           <div class="wx-astro-text">
             <span class="wx-astro-label">Sunrise</span>
-            <span class="wx-astro-time">${formatAstroTime(astro.sunrise)}</span>
+            ${renderAstroTime(astro.sunrise, astro.date)}
           </div>
           <div class="wx-astro-text">
             <span class="wx-astro-label">Sunset</span>
-            <span class="wx-astro-time">${formatAstroTime(astro.sunset)}</span>
+            ${renderAstroTime(astro.sunset, astro.date)}
           </div>
         </div>
       </div>
@@ -115,11 +154,11 @@ function renderAstroRow(astro: BrcAstro | null, fullMoonDate: string | null = nu
         <div class="wx-astro-pair">
           <div class="wx-astro-text">
             <span class="wx-astro-label">Moonrise</span>
-            <span class="wx-astro-time">${formatAstroTime(astro.moonrise)}</span>
+            ${renderAstroTime(astro.moonrise, astro.date)}
           </div>
           <div class="wx-astro-text">
             <span class="wx-astro-label">Moonset</span>
-            <span class="wx-astro-time">${formatAstroTime(astro.moonset)}</span>
+            ${renderAstroTime(astro.moonset, astro.date)}
           </div>
         </div>
       </div>
@@ -128,12 +167,68 @@ function renderAstroRow(astro: BrcAstro | null, fullMoonDate: string | null = nu
 }
 
 /** Rolling 24h SVG: temp / precip% / UV lines + wind arrows (direction = wind toward). */
-function renderHourlyForecastChart(weather: BrcWeather): string {
+function formatAirDistance(air: AirQuality): string | null {
+  const d = Number(air.distanceMiles);
+  if (!Number.isFinite(d) || d < 0) return null;
+  const miles = d >= 10 ? String(Math.round(d)) : d.toFixed(1).replace(/\.0$/, "");
+  const dir = air.direction ? ` ${air.direction}` : "";
+  return `${miles} mi${dir}`;
+}
+
+function renderAqiChip(air: AirQuality | null | undefined): string {
+  if (!air) return "";
+  const color = aqiBannerColor(air.category);
+  const shortCat =
+    air.category === "Unhealthy for sensitive groups" ? "USG" : air.category;
+  const dist = formatAirDistance(air);
+  const title = [
+    air.siteName,
+    dist,
+    air.source && air.source !== air.siteName ? air.source : null,
+    air.observedAt,
+    `PM2.5 ${air.pm25} µg/m³`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const loc = dist
+    ? `<span class="wx-now-aqi-loc">${escapeHtml(dist)}</span>`
+    : "";
+  return `<div class="wx-now-aqi" title="${escapeHtml(title)}" style="border-color:${color};color:${color};background:${color}22">
+      <span class="wx-now-aqi-num">AQI ${air.aqi}</span>
+      <span class="wx-now-aqi-cat">${escapeHtml(shortCat)}</span>
+      ${loc}
+    </div>`;
+}
+
+/** Chart AQI: pin hour 0 to the AirNow chip; scale the CAMS PM2.5 forecast to that observation. */
+function alignedHourlyAqi(
+  hours: BrcWeather["hours"],
+  air?: AirQuality | null,
+): Array<number | null> {
+  const raw = hours.map((h) =>
+    h.usAqi != null && Number.isFinite(h.usAqi) ? Math.round(h.usAqi) : null,
+  );
+  const observed =
+    air && Number.isFinite(air.aqi) ? Math.round(air.aqi) : null;
+  if (observed == null) return raw;
+  const nowForecast = raw[0];
+  if (nowForecast == null) {
+    return raw.map((v, i) => (i === 0 ? observed : v));
+  }
+  const scale = nowForecast > 0 ? observed / nowForecast : 1;
+  return raw.map((v, i) => {
+    if (i === 0) return observed;
+    if (v == null) return null;
+    return Math.max(0, Math.min(500, Math.round(v * scale)));
+  });
+}
+
+function renderHourlyForecastChart(weather: BrcWeather, air?: AirQuality | null): string {
   const hours = weather.hours;
   if (hours.length < 2) return "";
 
   const W = 392;
-  const chartTop = 11;
+  const chartTop = 16;
   const chartH = 90;
   const chartBottom = chartTop + chartH;
   const windY = chartBottom + 17;
@@ -192,8 +287,8 @@ function renderHourlyForecastChart(weather: BrcWeather): string {
     })
     .join("");
 
-  // Fixed 0–12 UV / 0–100% precip; show precip % when any hour has chance of rain
-  const showPrecipAxis = precip.some((p) => p > 0);
+  // Fixed 0–12 UV / 0–100% precip; show precip % only when rain chance is 8%+
+  const showPrecipAxis = precip.some((p) => p >= 8);
   const rightTicks = (showPrecipAxis
     ? [0, 50, 100].map((v) => {
         const y = yPrecip(v);
@@ -230,6 +325,41 @@ function renderHourlyForecastChart(weather: BrcWeather): string {
     })
     .join("");
 
+  const aqiSeries = alignedHourlyAqi(hours, air);
+  const aqiVals = aqiSeries.filter((v): v is number => v != null && Number.isFinite(v));
+  const showAqiBars = aqiVals.length > 0;
+  const aqiMax = showAqiBars ? Math.max(...aqiVals) : 0;
+  const aqiHi = Math.max(100, Math.ceil(aqiMax / 50) * 50);
+  const yAqi = (v: number) =>
+    chartBottom - (Math.min(aqiHi, Math.max(0, v)) / Math.max(1, aqiHi)) * chartH;
+  const hourGap = n > 1 ? plotW / (n - 1) : plotW;
+  const aqiBarW = Math.max(6, hourGap * 1.35);
+  const aqiBars = showAqiBars
+    ? hours
+        .map((h, i) => {
+          if (i % 2 !== 0) return "";
+          const aqi = aqiSeries[i];
+          if (aqi == null || !Number.isFinite(aqi)) return "";
+          const x = xAt(i);
+          const y = yAqi(aqi);
+          const barH = Math.max(2, chartBottom - y);
+          const color = aqiBannerColor(aqiCategory(aqi));
+          const labelY = Math.max(10, y - 3);
+          const cat = aqiCategory(aqi);
+          // First bar is only the right half so it does not cross the y-axis.
+          const barX = i === 0 ? x : x - aqiBarW / 2;
+          const barW = i === 0 ? aqiBarW / 2 : aqiBarW;
+          const labelX = i === 0 ? x + barW / 2 : x;
+          return `
+        <g class="wx-aqi-bar">
+          <title>AQI ${Math.round(aqi)} · ${escapeHtml(cat)}</title>
+          <rect x="${barX.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="1.4" fill="${color}" fill-opacity="0.34" />
+          <text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" fill="${color}" stroke="#0b1220" stroke-width="2.4" paint-order="stroke" font-size="8" font-weight="700">${Math.round(aqi)}</text>
+        </g>`;
+        })
+        .join("")
+    : "";
+
   const now = hours[0];
   const nowX = xAt(0);
   const dayCode = weather.astro?.weatherCode ?? now.weatherCode ?? 0;
@@ -238,14 +368,16 @@ function renderHourlyForecastChart(weather: BrcWeather): string {
     <div class="wx-now">
       <div class="wx-now-main">
         <span class="wx-now-temp" data-temp-f="${now.temperatureF}">${Math.round(now.temperatureF)}°F</span>
-        <span class="wx-now-meta"><span class="wx-now-range" data-temp-hi-f="${tMax}" data-temp-lo-f="${tMin}">${Math.round(tMax)}°/${Math.round(tMin)}°</span> · UV ${now.uvIndex.toFixed(1)} · precip ${Math.round(now.precipProb)}%</span>
+        <span class="wx-now-meta"><span class="wx-now-range" data-temp-hi-f="${tMax}" data-temp-lo-f="${tMin}">${Math.round(tMax)}°/${Math.round(tMin)}°</span> · precip ${Math.round(now.precipProb)}% · UV ${now.uvIndex.toFixed(1)}</span>
       </div>
+      ${renderAqiChip(air)}
       <div class="wx-now-icon">${renderWeatherConditionIcon(dayCode)}</div>
     </div>
     <div class="wx-legend">
       <span><i class="wx-swatch" style="background:#f0b429"></i> <span class="wx-legend-temp">Temp °F</span></span>
       <span><i class="wx-swatch" style="background:#3dd6c6"></i> Precip %</span>
       <span><i class="wx-swatch" style="background:#c084fc"></i> UV</span>
+      ${showAqiBars ? `<span><i class="wx-swatch wx-swatch-aqi"></i> AQI</span>` : ""}
     </div>
     <div class="wx-chart-wrap">
       <svg class="wx-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Next 24 hour forecast chart">
@@ -254,6 +386,7 @@ function renderHourlyForecastChart(weather: BrcWeather): string {
         ${tempTicks}
         ${rightTicks}
         <line x1="${nowX.toFixed(1)}" y1="${chartTop}" x2="${nowX.toFixed(1)}" y2="${chartBottom}" stroke="rgba(61,214,198,0.35)" stroke-dasharray="3 3" />
+        ${aqiBars}
         <polyline fill="none" stroke="#3dd6c6" stroke-width="1.75" stroke-linejoin="round" points="${precipPts}" />
         <polyline fill="none" stroke="#c084fc" stroke-width="1.75" stroke-linejoin="round" points="${uvPts}" />
         <polyline fill="none" stroke="#f0b429" stroke-width="2.25" stroke-linejoin="round" points="${tempPts}" />
@@ -272,6 +405,13 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0b1220" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Phage Camp" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/icons/app-icon.svg" />
   <title>${escapeHtml(title)}</title>
   <style>
     :root {
@@ -300,6 +440,57 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       background-position: center;
       background-attachment: fixed;
       background-repeat: no-repeat;
+    }
+    .data-ticker {
+      display: none;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      overflow: hidden;
+      border-bottom: 1px solid rgba(61, 214, 198, 0.35);
+      background: rgba(6, 14, 24, 0.92);
+      backdrop-filter: blur(10px);
+      color: var(--accent);
+      font-size: 0.82rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .data-ticker.is-on { display: block; }
+    .data-ticker[data-tone="green"] {
+      color: #06240f;
+      background: #6bcf7f;
+      border-bottom-color: #3da85a;
+    }
+    .data-ticker[data-tone="yellow"] {
+      color: #2a2400;
+      background: #f5e04a;
+      border-bottom-color: #c9b40f;
+    }
+    .data-ticker[data-tone="amber"] {
+      color: #2a1600;
+      background: #f0a020;
+      border-bottom-color: #c77a08;
+    }
+    .data-ticker[data-tone="red"] {
+      color: #2a0707;
+      background: #ff6b6b;
+      border-bottom-color: #e25555;
+    }
+    .data-ticker-track {
+      display: flex;
+      gap: 3.5rem;
+      width: max-content;
+      padding: 0.42rem 0;
+      animation: data-ticker-scroll 32s linear infinite;
+    }
+    .data-ticker-track span { white-space: nowrap; }
+    @keyframes data-ticker-scroll {
+      from { transform: translateX(0); }
+      to { transform: translateX(-50%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .data-ticker-track { animation: none; }
     }
     main {
       width: min(560px, calc(100% - 2rem));
@@ -338,15 +529,6 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       font-weight: 650;
       color: var(--ink);
     }
-    .panel-title-lg {
-      margin: 0 0 0.35rem;
-      font-size: 1.55rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      text-align: center;
-      color: var(--ink);
-      line-height: 1.25;
-    }
     .price {
       font-size: 2.4rem;
       font-weight: 700;
@@ -379,6 +561,20 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
     }
     .btn.danger { background: linear-gradient(135deg, #ff7b7b, #e25555); color: #2a0707; }
     .btn.small { width: auto; padding: 0.45rem 0.75rem; font-size: 0.85rem; margin: 0; }
+    .home-save-wrap { margin: 0.85rem 0 0; }
+    .home-save-wrap .btn { margin-top: 0; }
+    .home-save-hint { margin: 0.45rem 0 0; font-size: 0.82rem; }
+    .home-save-url {
+      display: block;
+      margin: 0.35rem 0 0;
+      font-size: 0.88rem;
+      color: var(--accent);
+      word-break: break-all;
+    }
+    body.is-standalone .home-save-wrap { display: none; }
+    dialog.leave-dialog:not([open]) {
+      display: none !important;
+    }
     .leave-dialog {
       border: 1px solid rgba(240,180,41,0.45);
       border-radius: 16px;
@@ -445,6 +641,13 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       font: inherit;
       color-scheme: dark;
     }
+    .pay-method-field.is-disabled {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    .pay-method-field.is-disabled select {
+      cursor: not-allowed;
+    }
     table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
     th, td { text-align: left; padding: 0.55rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
     th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; }
@@ -487,14 +690,64 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       transition: width 0.35s ease;
     }
     .lede { font-size: 1.05rem; color: var(--ink); line-height: 1.45; margin: 0.35rem 0 0.75rem; }
-    .page-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 0.75rem;
-      margin-bottom: 0.75rem;
+    .access-intro {
+      border-left: 3px solid var(--accent2);
+      background: rgba(240, 180, 41, 0.07);
     }
-    .page-header .brand { margin-bottom: 0; }
+    .access-intro .lede {
+      font-size: 1.12rem;
+      line-height: 1.5;
+      margin: 0;
+      font-weight: 450;
+    }
+    .access-intro .lede strong {
+      color: #f5d27a;
+      font-weight: 700;
+    }
+    .access-intro .access-note {
+      margin: 0.7rem 0 0;
+      font-size: 0.92rem;
+    }
+    .access-kicker {
+      margin: 0 0 0.45rem;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      text-align: left;
+      color: var(--muted);
+    }
+    .access-sub h3.access-tax {
+      margin: 0;
+      font-size: 1.12rem;
+      font-weight: 700;
+      color: var(--accent2);
+    }
+    .access-pay label {
+      color: var(--ink);
+      font-weight: 600;
+    }
+    .access-pay select,
+    .access-pay input {
+      border-color: rgba(240, 180, 41, 0.55);
+      background: rgba(240, 180, 41, 0.1);
+    }
+    .btn.quiet {
+      color: #7ec8ff;
+      background: transparent;
+      border: 1px solid #7ec8ff;
+      border-radius: 8px;
+      font-weight: 500;
+      font-size: 0.88rem;
+      line-height: 1.3;
+      padding: 0.62rem 0.85rem;
+      white-space: normal;
+    }
+    .btn.danger.ghost {
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid rgba(255, 107, 107, 0.45);
+    }
     .pay-methods {
       display: grid;
       gap: 1rem;
@@ -534,21 +787,166 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       .pay-qr-hint { display: none; }
     }
     .portal-top {
-      margin: 0.45rem 0 0.65rem;
+      margin: 2rem 0 0.65rem;
     }
     .btn.bmir {
       width: 100%;
       margin-top: 0;
-      padding: 0.85rem 1rem;
+      padding: 0.75rem 1rem;
       font-size: 1rem;
       letter-spacing: 0.01em;
-      gap: 0.55rem;
+      gap: 0.5rem;
     }
     .btn.bmir .radio-tower {
       flex: 0 0 auto;
       width: 1.35rem;
       height: 1.35rem;
       display: block;
+    }
+    .btn.bmir .bmir-logo {
+      flex: 0 0 auto;
+      width: 1.85rem;
+      height: 1.85rem;
+      display: block;
+      border-radius: 50%;
+      object-fit: cover;
+      background: #000;
+    }
+    .bmir-player { width: 100%; }
+    .bmir-shell {
+      display: flex;
+      align-items: stretch;
+      gap: 0.4rem;
+    }
+    .bmir-player:not([data-mode="idle"]) .bmir-shell > .btn.bmir { display: none; }
+    .bmir-player[data-mode="idle"] .bmir-deck { display: none; }
+    .bmir-shell > .btn.bmir {
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+    }
+    .bmir-deck {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+      margin: 0;
+      padding: 0.65rem 0.85rem;
+      border-radius: 12px;
+      color: #06241f;
+      background: linear-gradient(135deg, var(--accent), #2bb3a6);
+    }
+    .bmir-toggle {
+      appearance: none;
+      flex: 0 0 auto;
+      width: 2.55rem;
+      height: 2.55rem;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+      color: inherit;
+      background: rgba(6, 36, 31, 0.16);
+    }
+    .bmir-toggle svg {
+      width: 1.15rem;
+      height: 1.15rem;
+      display: block;
+    }
+    .bmir-player[data-mode="live"] .bmir-ic-play,
+    .bmir-player:not([data-mode="live"]) .bmir-ic-pause { display: none; }
+    .bmir-eq {
+      display: flex;
+      align-items: flex-end;
+      gap: 3px;
+      height: 1.05rem;
+      flex: 0 0 auto;
+    }
+    .bmir-eq i {
+      display: block;
+      width: 3px;
+      height: 4px;
+      border-radius: 1px;
+      font-style: normal;
+      background: currentColor;
+      transform-origin: bottom;
+    }
+    .bmir-player[data-mode="live"] .bmir-eq i {
+      animation: bmir-eq 0.85s ease-in-out infinite;
+    }
+    .bmir-player[data-mode="live"] .bmir-eq i:nth-child(2) { animation-delay: -0.2s; }
+    .bmir-player[data-mode="live"] .bmir-eq i:nth-child(3) { animation-delay: -0.45s; }
+    .bmir-player[data-mode="live"] .bmir-eq i:nth-child(4) { animation-delay: -0.1s; }
+    @keyframes bmir-eq {
+      0%, 100% { height: 4px; }
+      50% { height: 100%; }
+    }
+    .bmir-copy { flex: 1; min-width: 0; }
+    .bmir-kicker {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      opacity: 0.78;
+    }
+    .bmir-live-dot {
+      width: 0.45rem;
+      height: 0.45rem;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.45;
+    }
+    .bmir-player[data-mode="live"] .bmir-live-dot {
+      opacity: 1;
+      animation: bmir-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes bmir-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    .bmir-name {
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bmir-status {
+      margin: 0.12rem 0 0;
+      font-size: 0.78rem;
+      font-weight: 600;
+      line-height: 1.25;
+      opacity: 0.82;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bmir-player[data-mode="error"] .bmir-status { opacity: 1; }
+    .bmir-player audio { display: none; }
+    @media (prefers-reduced-motion: reduce) {
+      .bmir-eq i, .bmir-live-dot { animation: none !important; }
+    }
+    .wx-panel {
+      position: relative;
+    }
+    .wx-panel-title {
+      margin: 0 5.4rem 0.75rem 0;
+    }
+    .wx-panel > .wx-unit {
+      position: absolute;
+      top: 0.55rem;
+      right: 0.55rem;
+      z-index: 2;
     }
     .wx-unit {
       display: inline-flex;
@@ -614,6 +1012,34 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       align-items: center;
       min-width: 4.25rem;
     }
+    .wx-now-aqi {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 0.05rem;
+      padding: 0.28rem 0.7rem;
+      border: 1px solid;
+      border-radius: 8px;
+      min-width: 4.6rem;
+      line-height: 1.15;
+    }
+    .wx-now-aqi-num {
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+    .wx-now-aqi-cat {
+      font-size: 0.72rem;
+      font-weight: 650;
+      opacity: 0.92;
+    }
+    .wx-now-aqi-loc {
+      font-size: 0.62rem;
+      font-weight: 600;
+      opacity: 0.78;
+      white-space: nowrap;
+    }
     .wx-day-icon {
       flex: 0 0 auto;
       width: 4.25rem;
@@ -635,6 +1061,9 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       height: 0.7rem;
       border-radius: 2px;
       display: inline-block;
+    }
+    .wx-swatch-aqi {
+      background: linear-gradient(90deg, #3FA266, #f0b429, #fc6b83);
     }
     .wx-chart-wrap {
       margin: 0 -0.15rem;
@@ -718,6 +1147,14 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       font-weight: 600;
       line-height: 1.2;
     }
+    .wx-astro-day {
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      line-height: 1.2;
+    }
     .wx-dashboard {
       margin-top: 1rem;
       padding-top: 0.85rem;
@@ -781,8 +1218,8 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
     }
     .wx-radar-leaflet {
       width: 100%;
-      height: min(52vw, 320px);
-      min-height: 220px;
+      height: min(58vw, 380px);
+      min-height: 240px;
       background: #0b0f14;
     }
     .wx-radar-leaflet .leaflet-control-attribution {
@@ -831,6 +1268,10 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       background: #3dd6c6;
       border-radius: 2px;
     }
+    .wx-radar-leaflet .wx-radar-layer,
+    .wx-radar-leaflet .wx-smoke-layer {
+      will-change: opacity;
+    }
     .wx-radar-time {
       font-size: 0.75rem;
       color: var(--muted);
@@ -855,6 +1296,42 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       height: 8px;
       border-radius: 2px;
       background: linear-gradient(90deg, #0000ff, #00ffff, #00ff00, #ffff00, #ff0000, #ff00ff);
+    }
+    .wx-radar-links {
+      margin: 0.4rem 0 0;
+      font-size: 0.85rem;
+    }
+    .wx-radar-links a {
+      color: var(--accent);
+      font-weight: 650;
+    }
+    .wx-radar-overlays {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem 0.85rem;
+      margin-top: 0.45rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .wx-radar-overlays span {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.32rem;
+    }
+    .wx-lg-smoke {
+      width: 0.85rem;
+      height: 0.55rem;
+      border-radius: 2px;
+      background: linear-gradient(90deg, #fff7bc, #fe9929, #7a3e12);
+      display: inline-block;
+    }
+    .wx-flame-icon {
+      background: none !important;
+      border: none !important;
+    }
+    .wx-flame-icon svg {
+      display: block;
+      filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
     }
     .tabs {
       display: flex;
@@ -972,9 +1449,14 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
     .profile-row .btn { width: auto; margin: 0; }
     .profile-row input { flex: 1; min-width: 10rem; margin: 0; }
     .profile-status { font-size: 0.8rem; color: var(--muted); margin-top: 0.55rem; }
+    .data-op-macs { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.4rem 0 0; }
+    .data-op-macs code { font-size: 0.78rem; }
   </style>
 </head>
 <body>
+  <div class="data-ticker" id="data-ticker" data-tone="empty" hidden>
+    <div class="data-ticker-track" id="data-ticker-track"></div>
+  </div>
   <main class="${opts?.admin ? "wide" : ""}">
     ${body}
   </main>
@@ -983,14 +1465,47 @@ function layout(title: string, body: string, opts?: { admin?: boolean }): string
       var narrow = window.matchMedia && window.matchMedia("(max-width: 900px)").matches;
       var uaMobile = /Mobi|Android|iPhone|iPod|IEMobile|Opera Mini/i.test(navigator.userAgent || "");
       document.body.classList.add(narrow || uaMobile ? "pay-mobile" : "pay-desktop");
+      if (window.navigator.standalone || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches)) {
+        document.body.classList.add("is-standalone");
+      }
+
+      var ticker = document.getElementById("data-ticker");
+      var track = document.getElementById("data-ticker-track");
+      if (!ticker || !track) return;
+
+      function paintTicker(data) {
+        if (!data || data.tone === "empty" || data.remaining_gb == null) {
+          ticker.hidden = true;
+          ticker.classList.remove("is-on");
+          return;
+        }
+        var text = data.label || "";
+        var bits = [];
+        for (var i = 0; i < 8; i++) bits.push("<span>" + text.replace(/</g, "") + "</span>");
+        track.innerHTML = bits.join("");
+        ticker.setAttribute("data-tone", data.tone || "green");
+        ticker.hidden = false;
+        ticker.classList.add("is-on");
+      }
+
+      function loadTicker() {
+        fetch("/api/starlink-data", { headers: { "Accept": "application/json" } })
+          .then(function (res) { return res.ok ? res.json() : null; })
+          .then(paintTicker)
+          .catch(function () {});
+      }
+      loadTicker();
+      setInterval(loadTicker, 30000);
     })();
   </script>
 </body>
 </html>`;
 }
 
-const BMIR_LIVE_HREF = "https://bmir.org/";
 const OUTSIDE_BROWSE_HREF = "https://thephage.org/public/";
+const INNOVATE_HREF = "https://innovate.burningman.org/";
+
+const BMIR_LOGO_IMG = `<img class="bmir-logo" src="/assets/brands/bmir.png" alt="" width="192" height="192" decoding="async" />`;
 
 const RADIO_TOWER_ICON = `<svg class="radio-tower" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
   <path fill="currentColor" d="M12 1.75a1 1 0 0 1 1 1V4.1l2.35 3.53a1 1 0 0 1-.83 1.55H9.48a1 1 0 0 1-.83-1.55L11 4.1V2.75a1 1 0 0 1 1-1Zm0 5.35L11.15 9.18h1.7L12 7.1Z"/>
@@ -999,35 +1514,495 @@ const RADIO_TOWER_ICON = `<svg class="radio-tower" viewBox="0 0 24 24" aria-hidd
   <path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M5.2 7.2c-1.7 1.5-2.7 3.5-2.7 5.7M18.8 7.2c1.7 1.5 2.7 3.5 2.7 5.7M7.1 8.6c-1.15 1.1-1.85 2.55-1.85 4.2M16.9 8.6c1.15 1.1 1.85 2.55 1.85 4.2"/>
 </svg>`;
 
-function guestBrand(opts?: { tempUnit?: boolean }): string {
-  const unitToggle = opts?.tempUnit
-    ? `<div class="wx-unit" role="group" aria-label="Temperature unit">
+const BMIR_PLAY_ICON = `<svg class="bmir-ic-play" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 5.15v13.7L19.2 12 8 5.15Z"/></svg>`;
+const BMIR_PAUSE_ICON = `<svg class="bmir-ic-pause" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M7 5h3.4v14H7V5Zm6.6 0H17v14h-3.4V5Z"/></svg>`;
+
+function guestBrand(): string {
+  return `<div class="brand">Phage Camp @ The Institute</div>`;
+}
+
+/** Phone home-screen shortcut / desktop download — browsers block setting the real homepage. */
+function saveHomePageBlock(): string {
+  const portalUrl = `${config.publicUrl}/`;
+  return `
+    <div class="home-save-wrap" id="home-save-wrap" data-portal="${escapeHtml(portalUrl)}">
+      <button type="button" class="btn secondary" id="home-save-btn">Save as my home page</button>
+      <p class="home-save-hint" id="home-save-hint">Puts a shortcut on your phone so you can get back here in one tap.</p>
+    </div>
+    <dialog class="leave-dialog" id="home-save-dialog" aria-labelledby="home-save-title">
+      <div class="leave-dialog-inner">
+        <div class="leave-dialog-badge">Saved</div>
+        <h2 id="home-save-title">Get back here anytime</h2>
+        <p id="home-save-copy"></p>
+        <code class="home-save-url" id="home-save-url">${escapeHtml(portalUrl)}</code>
+        <form method="dialog">
+          <button class="btn leave-stay" value="ok">Done</button>
+        </form>
+      </div>
+    </dialog>
+    <script>
+      (function () {
+        var wrap = document.getElementById("home-save-wrap");
+        var btn = document.getElementById("home-save-btn");
+        var hint = document.getElementById("home-save-hint");
+        var dialog = document.getElementById("home-save-dialog");
+        var copyEl = document.getElementById("home-save-copy");
+        var urlEl = document.getElementById("home-save-url");
+        if (!wrap || !btn || !dialog) return;
+
+        var KEY = "phage-home-saved";
+        var ua = navigator.userAgent || "";
+        var isIos = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+        var isAndroid = /Android/i.test(ua);
+        var isMobile = isIos || isAndroid || /Mobi|IEMobile|Opera Mini/i.test(ua);
+        var deferredPrompt = null;
+
+        window.addEventListener("beforeinstallprompt", function (e) {
+          e.preventDefault();
+          deferredPrompt = e;
+        });
+
+        function homeUrl() {
+          if (location.origin) return location.origin + "/";
+          return wrap.getAttribute("data-portal") || "/";
+        }
+
+        function markSaved() {
+          try { localStorage.setItem(KEY, "1"); } catch (e) {}
+          btn.textContent = "Saved — tap to save again";
+          if (hint) hint.textContent = "Shortcut saved on this device. Tap again if you need another copy.";
+        }
+
+        try {
+          if (localStorage.getItem(KEY)) markSaved();
+        } catch (e) {}
+
+        function copyUrl(url) {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(url).catch(function () {});
+            return;
+          }
+          try {
+            var input = document.createElement("input");
+            input.value = url;
+            document.body.appendChild(input);
+            input.select();
+            document.execCommand("copy");
+            input.remove();
+          } catch (e) {}
+        }
+
+        function downloadShortcut(url) {
+          var blob = new Blob(["[InternetShortcut]\\r\\nURL=" + url + "\\r\\n"], { type: "application/octet-stream" });
+          var objectUrl = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = objectUrl;
+          a.download = "Phage Camp.url";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 1500);
+        }
+
+        function instructions(shared) {
+          if (isIos) {
+            return shared
+              ? "If you chose Add to Home Screen, look for the Phage Camp icon next to your apps. If not: tap the button again, then Share → Add to Home Screen (swipe the bottom row if it is hidden)."
+              : "On iPhone, tap Share (the square with the arrow) → Add to Home Screen. That puts this page on your home screen.";
+          }
+          if (isAndroid) {
+            return "Open the browser menu (⋮) and tap Add to Home screen. You will get a Phage Camp icon so you can return in one tap.";
+          }
+          return "A shortcut file was saved to your downloads. Double-click it anytime, or bookmark this page with Ctrl+D (⌘D on a Mac). The address is also copied to your clipboard.";
+        }
+
+        function openDialog(shared) {
+          if (copyEl) copyEl.textContent = instructions(shared);
+          if (urlEl) urlEl.textContent = homeUrl();
+          if (typeof dialog.showModal === "function") dialog.showModal();
+        }
+
+        function finish(shared) {
+          markSaved();
+          openDialog(shared);
+        }
+
+        btn.addEventListener("click", function () {
+          var url = homeUrl();
+          copyUrl(url);
+          if (deferredPrompt) {
+            deferredPrompt.prompt();
+            deferredPrompt.userChoice.then(function () {
+              deferredPrompt = null;
+              finish(true);
+            }).catch(function () { finish(false); });
+            return;
+          }
+          if (isMobile && navigator.share) {
+            navigator.share({ title: "Phage Camp", text: "Camp portal home", url: url })
+              .then(function () { finish(true); })
+              .catch(function () { finish(false); });
+            return;
+          }
+          downloadShortcut(url);
+          finish(false);
+        });
+      })();
+    </script>`;
+}
+
+function starlinkDataPanel(opts: {
+  view: StarlinkDataOperatorView;
+  flash?: string;
+  error?: string;
+  compact?: boolean;
+}): string {
+  const { view, flash, error, compact = false } = opts;
+  const remaining = view.remaining_gb == null ? "" : String(view.remaining_gb);
+  const limit = view.limit_gb == null ? "" : String(view.limit_gb);
+  const reserved =
+    view.reserved_gb == null ? String(DEFAULT_RESERVED_GB) : String(view.reserved_gb);
+  const updated = view.updated_at
+    ? `Last set ${escapeHtml(formatUpdatedAgo(view.updated_at))}`
+    : "Not set yet — enter what the Starlink app shows.";
+  const macs = [...new Set([...view.unique_ids, ...view.bound_macs])]
+    .map((m) => `<code>${escapeHtml(m)}</code>`)
+    .join("");
+  const paceNote =
+    view.available_gb != null && view.daily_pct_left != null && view.daily_budget_gb != null
+      ? ` · ticker: ${escapeHtml(view.label)} · today’s share ${escapeHtml(formatGb(view.daily_budget_gb))} GB (${escapeHtml(formatGb(view.used_today_gb ?? 0))} used)`
+      : view.remaining_gb != null
+        ? ` · ticker shows ${escapeHtml(formatGb(view.remaining_gb))} GB`
+        : "";
+
+  if (!view.operator) {
+    return `
+    <div class="panel">
+      <h2>Authorize this device</h2>
+      ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
+      ${flash ? `<p class="ok">${escapeHtml(flash)}</p>` : ""}
+      <p>This portal identifies you by Wi‑Fi MAC, not IMEI. On your phone use <strong>About phone → Device Wi‑Fi MAC</strong>. On a computer, use the hardware Wi‑Fi address (or the Device line on the guest page).</p>
+      <p class="meta">This device: <code>${escapeHtml(view.current_mac ?? "unknown")}</code></p>
+      ${
+        view.current_mac
+          ? `<form method="POST" action="/data/bind">
+              <label for="unique-id">Your unique ID (Wi‑Fi MAC)</label>
+              <input id="unique-id" name="unique_id" placeholder="b0:d5:fb:9c:1a:ef" required autocomplete="off" spellcheck="false" />
+              <button class="btn" type="submit">Authorize this device</button>
+            </form>`
+          : `<p class="err">Could not see this device’s MAC. Reconnect to camp Wi‑Fi and retry.</p>`
+      }
+    </div>`;
+  }
+
+  return `
+    <div class="panel">
+      <h2>${compact ? "Starlink data remaining" : "Update remaining data"}</h2>
+      ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
+      ${flash ? `<p class="ok">${escapeHtml(flash)}</p>` : ""}
+      <p class="meta">${escapeHtml(updated)}${paceNote}</p>
+      <form method="POST" action="/data/remaining">
+        <label for="remaining-gb">Remaining (GB)</label>
+        <input id="remaining-gb" name="remaining_gb" type="number" min="0" max="10000" step="0.01" inputmode="decimal" value="${escapeHtml(remaining)}" required />
+        <label for="limit-gb">Plan size (GB, optional)</label>
+        <input id="limit-gb" name="limit_gb" type="number" min="0" max="10000" step="0.01" inputmode="decimal" value="${escapeHtml(limit)}" placeholder="100" />
+        <label for="reserved-gb">Hold for Monday (GB)</label>
+        <input id="reserved-gb" name="reserved_gb" type="number" min="0" max="10000" step="0.01" inputmode="decimal" value="${escapeHtml(reserved)}" />
+        <p class="meta">Camp can use remaining minus this hold. Daily % left is today’s unused share of that pool (pool ÷ days until Mon 8/31, minus GB used since the last remaining update today). Set hold to 0 after Monday.</p>
+        <button class="btn" type="submit">Save remaining data</button>
+      </form>
+      ${
+        compact
+          ? `<p class="meta" style="margin-top:0.75rem">This device <code>${escapeHtml(view.current_mac ?? "")}</code>. Add your computer at <a href="/data">/data</a>.</p>`
+          : `<p class="meta" style="margin-top:0.85rem">Authorized unique IDs + bound MACs</p>
+             <div class="data-op-macs">${macs}</div>
+             <form method="POST" action="/data/operators" style="margin-top:0.85rem">
+               <label for="add-unique-id">Add another device unique ID (computer Wi‑Fi MAC)</label>
+               <input id="add-unique-id" name="unique_id" placeholder="aa:bb:cc:dd:ee:ff" required autocomplete="off" spellcheck="false" />
+               <button class="btn secondary" type="submit">Add device</button>
+             </form>
+             <p class="meta">On the computer, open <code>/data</code> and enter the same unique ID if Android/macOS is using a randomized MAC.</p>`
+      }
+    </div>`;
+}
+
+export function starlinkDataPage(opts: {
+  view: StarlinkDataOperatorView;
+  flash?: string;
+  error?: string;
+}): string {
+  return layout(
+    "Starlink data",
+    `
+    ${guestBrand()}
+    <p class="nav" style="margin:0 0 1rem"><a href="/">← Back</a></p>
+    <h1>Starlink data remaining</h1>
+    <p class="lede">Manual ticker for camp. Re-check Starlink <strong>Data usage</strong> each day and save remaining here so Daily % left stays honest — pace together and still use today’s share.</p>
+    ${starlinkDataPanel({ view: opts.view, flash: opts.flash, error: opts.error })}
+    `,
+  );
+}
+
+function wxUnitToggle(): string {
+  return `<div class="wx-unit" role="group" aria-label="Temperature unit">
         <button type="button" class="wx-unit-btn is-active" data-wx-unit="F" aria-pressed="true">°F</button>
         <button type="button" class="wx-unit-btn" data-wx-unit="C" aria-pressed="false">°C</button>
-      </div>`
-    : "";
-  return `<div class="page-header">
-    <div class="brand">Phage Camp @ The Institute</div>
-    ${unitToggle}
-  </div>`;
+      </div>`;
 }
 
 function bmirListenButton(): string {
   return `
     <div class="portal-top">
-      <a class="btn bmir" href="${escapeHtml(BMIR_LIVE_HREF)}" target="_blank" rel="noopener">
-        ${RADIO_TOWER_ICON}
-        Listen to BMIR Live!
-        ${RADIO_TOWER_ICON}
-      </a>
-    </div>`;
+      <div class="bmir-player" id="bmir-player" data-mode="idle" data-stream="${escapeHtml(BMIR_STREAM_PATH)}" data-fallback="${escapeHtml(BMIR_DIRECT_STREAM)}">
+        <div class="bmir-shell">
+          <button type="button" class="btn bmir" data-bmir-start aria-label="Play BMIR live radio">
+            ${RADIO_TOWER_ICON}
+            ${BMIR_LOGO_IMG}
+            Listen to BMIR Live!
+            ${RADIO_TOWER_ICON}
+          </button>
+          <div class="bmir-deck">
+            <button type="button" class="bmir-toggle" data-bmir-toggle aria-label="Pause BMIR">
+              ${BMIR_PLAY_ICON}
+              ${BMIR_PAUSE_ICON}
+            </button>
+            <div class="bmir-eq" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+            <div class="bmir-copy">
+              <div class="bmir-kicker"><span class="bmir-live-dot"></span> BMIR 94.5 FM</div>
+              <div class="bmir-name">Burning Man Information Radio</div>
+              <p class="bmir-status" data-bmir-status>Connecting…</p>
+            </div>
+            <audio data-bmir-audio preload="none" playsinline></audio>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var root = document.getElementById("bmir-player");
+        if (!root) return;
+        var audio = root.querySelector("[data-bmir-audio]");
+        var statusEl = root.querySelector("[data-bmir-status]");
+        var startBtn = root.querySelector("[data-bmir-start]");
+        var toggleBtn = root.querySelector("[data-bmir-toggle]");
+        if (!audio || !startBtn || !toggleBtn) return;
+        var sources = [root.getAttribute("data-stream") || "/bmir/stream", root.getAttribute("data-fallback") || ""].filter(Boolean);
+        var sourceIndex = 0;
+        var loadTimer = 0;
+        var hourTimer = 0;
+        var wanted = false;
+        var playedMs = 0;
+        var playStartedAt = 0;
+        var SESSION_MS = ${BMIR_MAX_LISTEN_MS};
+
+        function setMode(mode, label) {
+          root.setAttribute("data-mode", mode);
+          if (statusEl && label) statusEl.textContent = label;
+          toggleBtn.setAttribute("aria-label", mode === "live" ? "Pause BMIR" : "Play BMIR");
+          toggleBtn.setAttribute("aria-pressed", mode === "live" ? "true" : "false");
+        }
+
+        function clearLoadTimer() {
+          if (loadTimer) {
+            clearTimeout(loadTimer);
+            loadTimer = 0;
+          }
+        }
+
+        function clearHourTimer() {
+          if (hourTimer) {
+            clearTimeout(hourTimer);
+            hourTimer = 0;
+          }
+        }
+
+        function streamedMs() {
+          var n = playedMs;
+          if (playStartedAt) n += Date.now() - playStartedAt;
+          return n;
+        }
+
+        function remainingMs() {
+          return SESSION_MS - streamedMs();
+        }
+
+        function stopDownload() {
+          clearLoadTimer();
+          audio.pause();
+          audio.removeAttribute("src");
+          audio.load();
+        }
+
+        function stopPlayingClock() {
+          if (playStartedAt) {
+            playedMs += Date.now() - playStartedAt;
+            playStartedAt = 0;
+          }
+          clearHourTimer();
+        }
+
+        function armHourTimer() {
+          clearHourTimer();
+          var left = remainingMs();
+          if (left <= 0) {
+            endSession();
+            return;
+          }
+          hourTimer = setTimeout(endSession, left);
+        }
+
+        function markPlayingClock() {
+          if (!playStartedAt) playStartedAt = Date.now();
+          armHourTimer();
+        }
+
+        function clearMediaSession() {
+          if (!navigator.mediaSession) return;
+          try {
+            navigator.mediaSession.setActionHandler("play", null);
+            navigator.mediaSession.setActionHandler("pause", null);
+            navigator.mediaSession.setActionHandler("stop", null);
+            navigator.mediaSession.metadata = null;
+            navigator.mediaSession.playbackState = "none";
+          } catch (e) {}
+        }
+
+        function endSession() {
+          wanted = false;
+          stopPlayingClock();
+          playedMs = 0;
+          playStartedAt = 0;
+          stopDownload();
+          clearMediaSession();
+          setMode("idle");
+        }
+
+        function checkHourCap() {
+          if (!wanted && root.getAttribute("data-mode") === "idle") return;
+          if (streamedMs() >= SESSION_MS) endSession();
+        }
+
+        function srcAt(i) {
+          var base = sources[i];
+          var sep = base.indexOf("?") >= 0 ? "&" : "?";
+          return base + sep + "t=" + Date.now();
+        }
+
+        function bindMediaSession() {
+          if (!navigator.mediaSession) return;
+          try {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: "BMIR 94.5 FM",
+              artist: "Burning Man Information Radio"
+            });
+            navigator.mediaSession.setActionHandler("play", function () {
+              if (root.getAttribute("data-mode") === "idle") return;
+              start();
+            });
+            navigator.mediaSession.setActionHandler("pause", function () { pause(); });
+            navigator.mediaSession.setActionHandler("stop", function () { pause(); });
+          } catch (e) {}
+        }
+
+        function start() {
+          if (root.getAttribute("data-mode") === "idle") {
+            playedMs = 0;
+            playStartedAt = 0;
+          }
+          wanted = true;
+          sourceIndex = 0;
+          setMode("loading", "Connecting…");
+          bindMediaSession();
+          markPlayingClock();
+          playCurrent();
+        }
+
+        function playCurrent() {
+          if (!wanted) return;
+          if (remainingMs() <= 0) {
+            endSession();
+            return;
+          }
+          if (sourceIndex >= sources.length) {
+            setMode("error", "BMIR is off the air. Tap to retry.");
+            stopPlayingClock();
+            stopDownload();
+            return;
+          }
+          clearLoadTimer();
+          setMode("loading", "Connecting…");
+          audio.src = srcAt(sourceIndex);
+          var playPromise = audio.play();
+          if (playPromise && playPromise.catch) {
+            playPromise.catch(function () {
+              if (!wanted) return;
+              sourceIndex += 1;
+              playCurrent();
+            });
+          }
+          loadTimer = setTimeout(function () {
+            if (!wanted) return;
+            if (root.getAttribute("data-mode") === "loading") {
+              sourceIndex += 1;
+              playCurrent();
+            }
+          }, 12000);
+        }
+
+        function pause() {
+          wanted = false;
+          stopPlayingClock();
+          stopDownload();
+          setMode("paused", "Paused — tap to rejoin live");
+        }
+
+        startBtn.addEventListener("click", function () { start(); });
+        toggleBtn.addEventListener("click", function () {
+          if (root.getAttribute("data-mode") === "live") pause();
+          else start();
+        });
+        audio.addEventListener("playing", function () {
+          if (!wanted) return;
+          clearLoadTimer();
+          markPlayingClock();
+          setMode("live", "Live");
+        });
+        audio.addEventListener("waiting", function () {
+          if (!wanted) return;
+          if (root.getAttribute("data-mode") === "live") setMode("live", "Buffering…");
+        });
+        audio.addEventListener("timeupdate", checkHourCap);
+        audio.addEventListener("error", function () {
+          if (!wanted) return;
+          if (remainingMs() <= 0) {
+            endSession();
+            return;
+          }
+          sourceIndex += 1;
+          playCurrent();
+        });
+        audio.addEventListener("ended", function () {
+          if (!wanted) return;
+          if (remainingMs() <= 0) {
+            endSession();
+            return;
+          }
+          sourceIndex = 0;
+          playCurrent();
+        });
+        document.addEventListener("visibilitychange", checkHourCap);
+        window.addEventListener("pagehide", checkHourCap);
+      })();
+    </script>`;
 }
 
-function guestTabs(active: "portal" | "events"): string {
-  return `<nav class="tabs" aria-label="Portal">
-    <a href="/" class="${active === "portal" ? "active" : ""}">Portal</a>
-    <a href="/events" class="${active === "events" ? "active" : ""}">Events</a>
-  </nav>`;
+function innovateAppsPanel(): string {
+  return `
+    <div class="panel">
+      <h2 style="margin-top:0">Burning Man Innovate</h2>
+      <p class="lede" style="margin-top:0">Community apps for this year's burn — event guides, maps, camp directories, and other playa tools built on official Burning Man open data.</p>
+      <a class="btn" href="${escapeHtml(INNOVATE_HREF)}">Open BRC Innovate</a>
+    </div>`;
 }
 
 /** First-visit gate: collect playa name for a new MAC and never ask again once saved. */
@@ -1038,7 +2013,6 @@ function playaNameGate(ask: boolean): string {
       <div class="leave-dialog-inner">
         <div class="leave-dialog-badge">Welcome</div>
         <h2 id="playa-name-title">What is your playa name?</h2>
-        <p style="margin:0 0 0.35rem">We'll remember it for this device so we don't ask again.</p>
         <form id="playa-name-form">
           <label for="playa-name-input">Playa name</label>
           <input id="playa-name-input" name="playa_name" type="text" autocomplete="nickname" required maxlength="48" autofocus placeholder="Your burner name" />
@@ -1118,6 +2092,7 @@ function adminNav(): string {
   return `<div class="nav">
       <a href="/admin">Dashboard</a>
       <a href="/admin/events">Events</a>
+      <a href="/data">Starlink data</a>
       <a href="/">Guest portal</a>
       <form method="POST" action="/admin/logout" style="display:inline"><button class="btn small secondary" type="submit">Log out</button></form>
     </div>`;
@@ -1326,6 +2301,8 @@ function emergencyAccessBlock(opts: {
     playa_name: string;
   };
   error?: string;
+  guestHoldActive?: boolean;
+  reservedGb?: number | null;
 }): string {
   const {
     settings,
@@ -1337,6 +2314,8 @@ function emergencyAccessBlock(opts: {
     playaName = "",
     draft,
     error,
+    guestHoldActive = false,
+    reservedGb = null,
   } = opts;
   const gateQuestion = membersGateChallenge.question;
   const gateAnswerLabel = membersGateChallenge.answerLabel;
@@ -1346,7 +2325,7 @@ function emergencyAccessBlock(opts: {
   const cooldownLabel = formatCooldownMinutes(quickCooldownMs);
 
   const fullAccessButton = hasPayMethod
-    ? `<button type="button" class="btn" id="full-access-open">Full Internet Access - Camp Members Only</button>`
+    ? `<button type="button" class="btn quiet" id="full-access-open">Phage VIP - I wants ur internetz right now thx.</button>`
     : `<p class="warn">Payment links are not configured yet. Ask camp admin.</p>`;
 
   const donationBlock = fullAccessFormFields({
@@ -1355,7 +2334,6 @@ function emergencyAccessBlock(opts: {
     methods,
     draft,
     error,
-    showContinue: membersUnlocked,
   });
 
   const quickBlock = onQuickCooldown
@@ -1364,26 +2342,24 @@ function emergencyAccessBlock(opts: {
       ? `<p class="err" style="margin:0.75rem 0 0">Could not identify this device. Reconnect to Wi‑Fi.</p>`
       : `<form method="POST" action="/quick" id="quick-access-form">
                   <input type="hidden" name="mac" value="${escapeHtml(mac)}" />
-                  <button class="btn" type="button" id="quick-access-open">Just for 5 minutes pls!</button>
+                  <button class="btn quiet" type="button" id="quick-access-open">Can i haz internet just really quick pls? - Visitors (10 min)</button>
                 </form>`;
 
-  const internetButtonsBlock = !membersUnlocked
-    ? `<div class="access-sub">
+  const internetButtonsBlock = guestHoldActive
+    ? `<p class="warn" style="margin:0.75rem 0 0">New guest internet is paused — ${escapeHtml(formatGb(reservedGb ?? DEFAULT_RESERVED_GB))} GB is held for Monday. Ask Jaybird if this is an emergency.</p>`
+    : `<div class="access-sub">
         ${quickBlock}
         <div style="margin-top:0.85rem">${fullAccessButton}</div>
-      </div>`
-    : "";
+      </div>`;
 
   return `
     <div class="panel" id="full-access-section">
-      <h2 class="panel-title-lg">Internet for Emergencies Only</h2>
-      <div class="access-sub">
-        ${donationBlock}
-      </div>
+      <h2 class="access-kicker">Internet for Emergencies Only</h2>
+      ${guestHoldActive ? "" : `<div class="access-sub">${donationBlock}</div>`}
       ${internetButtonsBlock}
     </div>
     ${
-      (!onQuickCooldown && mac) || hasPayMethod
+      !guestHoldActive && ((!onQuickCooldown && mac) || hasPayMethod)
         ? `<dialog class="leave-dialog" id="leave-brc-dialog" aria-labelledby="leave-brc-title">
             <div class="leave-dialog-inner">
               <div class="leave-dialog-badge">Warning</div>
@@ -1428,23 +2404,73 @@ function emergencyAccessBlock(opts: {
               var showWarningAfterMembers = false;
 
               function goFullAccess() {
-                // Form is only server-rendered after members cookie is set — reload if missing.
-                var focusEl = document.getElementById("donation-tier") || document.getElementById("full-access-form");
-                if (focusEl) {
-                  var target = document.getElementById("full-access-section");
-                  if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
-                  if (typeof focusEl.focus === "function") {
-                    try { focusEl.focus({ preventScroll: true }); } catch (e) { focusEl.focus(); }
-                  }
+                var form = document.getElementById("full-access-form");
+                var outside = ${JSON.stringify(OUTSIDE_BROWSE_HREF)};
+                if (!form) {
+                  window.location.href = outside;
                   return;
                 }
-                window.location.href = "/access#full-access-section";
+                var amountEl = document.getElementById("donation-tier");
+                var methodEl = document.getElementById("pay-method");
+                var customEl = document.getElementById("custom-amount");
+                var hasMethod = methodEl && methodEl.value;
+                var presetCents = amountEl && amountEl.value && amountEl.value !== "custom"
+                  ? parseInt(amountEl.value, 10)
+                  : NaN;
+                var customOk = amountEl && amountEl.value === "custom" && customEl && parseFloat(customEl.value) > 0;
+                var paidReady = (presetCents > 0 || customOk) && hasMethod;
+                if (!paidReady && amountEl) amountEl.value = "0";
+                if (methodEl) {
+                  methodEl.required = false;
+                  methodEl.disabled = false;
+                }
+                form.onsubmit = null;
+                form.removeAttribute("onsubmit");
+                form.submit();
+              }
+
+              function otherOpenDialog(except) {
+                var nodes = document.querySelectorAll("dialog");
+                for (var i = 0; i < nodes.length; i++) {
+                  if (nodes[i] !== except && nodes[i].open) return nodes[i];
+                }
+                return null;
+              }
+
+              /** Open a modal only after the previous one has left the top layer. */
+              function showModalWhenReady(el, thenFn) {
+                if (!el) return;
+                if (typeof el.showModal !== "function") {
+                  if (thenFn) thenFn();
+                  return;
+                }
+                var tries = 0;
+                function tryOpen() {
+                  if (otherOpenDialog(el)) {
+                    if (tries++ < 20) setTimeout(tryOpen, 16);
+                    return;
+                  }
+                  try {
+                    el.returnValue = "";
+                    if (!el.open) el.showModal();
+                  } catch (err) {
+                    if (tries++ < 20) setTimeout(tryOpen, 32);
+                    return;
+                  }
+                  if (thenFn) thenFn();
+                }
+                requestAnimationFrame(function () {
+                  requestAnimationFrame(tryOpen);
+                });
               }
 
               function openLeaveWarning(action) {
                 pending = action;
-                if (typeof dialog.showModal === "function") dialog.showModal();
-                else if (action === "quick" && quickForm) quickForm.submit();
+                if (typeof dialog.showModal === "function") {
+                  showModalWhenReady(dialog);
+                  return;
+                }
+                if (action === "quick" && quickForm) quickForm.submit();
                 else if (action === "full") goFullAccess();
               }
 
@@ -1457,10 +2483,11 @@ function emergencyAccessBlock(opts: {
                 }
                 if (membersAnswer) membersAnswer.value = "";
                 if (membersDialog && typeof membersDialog.showModal === "function") {
-                  membersDialog.showModal();
-                  if (membersAnswer) {
-                    try { membersAnswer.focus(); } catch (e) {}
-                  }
+                  showModalWhenReady(membersDialog, function () {
+                    if (membersAnswer) {
+                      try { membersAnswer.focus(); } catch (e) {}
+                    }
+                  });
                   return;
                 }
                 var guess = window.prompt(membersGateQuestion);
@@ -1514,13 +2541,16 @@ function emergencyAccessBlock(opts: {
               if (quickBtn) quickBtn.addEventListener("click", function () { openLeaveWarning("quick"); });
               if (fullBtn) {
                 fullBtn.addEventListener("click", function () {
-                  if (membersUnlocked) goFullAccess();
+                  if (membersUnlocked) openLeaveWarning("full");
                   else openMembersGate();
                 });
               }
 
               dialog.addEventListener("close", function () {
-                if (dialog.returnValue !== "confirm") return;
+                if (dialog.returnValue !== "confirm") {
+                  pending = null;
+                  return;
+                }
                 if (pending === "quick" && quickForm) quickForm.submit();
                 else if (pending === "full") goFullAccess();
               });
@@ -1529,8 +2559,7 @@ function emergencyAccessBlock(opts: {
                 membersDialog.addEventListener("close", function () {
                   if (!showWarningAfterMembers) return;
                   showWarningAfterMembers = false;
-                  // Defer so the members dialog fully dismisses before the warning opens.
-                  setTimeout(function () { openLeaveWarning("full"); }, 0);
+                  openLeaveWarning("full");
                 });
               }
 
@@ -1559,10 +2588,14 @@ export function guestPaywallPage(opts: {
   allowed: boolean;
   paidUntil: number | null;
   weather: BrcWeather;
+  air?: AirQuality | null;
   playaName?: string;
   askPlayaName?: boolean;
   canceled?: boolean;
   error?: string;
+  starlinkData?: StarlinkDataOperatorView;
+  dataFlash?: string;
+  dataError?: string;
 }): string {
   const {
     settings,
@@ -1570,10 +2603,16 @@ export function guestPaywallPage(opts: {
     allowed,
     paidUntil,
     weather,
+    air = null,
     askPlayaName = false,
     canceled,
     error,
+    starlinkData,
+    dataFlash,
+    dataError,
   } = opts;
+  const wxCenter = getWeatherCenter();
+  const watchDutyHref = watchDutyMapUrl(wxCenter.lat, wxCenter.lon, 8);
 
   const dashboardBlock = `
       <div class="wx-dashboard">
@@ -1591,12 +2630,14 @@ export function guestPaywallPage(opts: {
       </div>`;
 
   const weatherPanel = `
-    <div class="panel">
-      <h2 style="margin-top:0">${escapeHtml(WEATHER_SITE_LABEL)} weather</h2>
+    <div class="panel wx-panel">
+      ${wxUnitToggle()}
+      <h2 class="wx-panel-title">${escapeHtml(WEATHER_SITE_LABEL)} Weather</h2>
       ${
         weather.error || !weather.hours.length
-          ? `<p class="warn">Forecast temporarily unavailable${weather.error ? ` (${escapeHtml(weather.error)})` : ""}.</p>`
-          : renderHourlyForecastChart(weather)
+          ? `<p class="warn">Forecast temporarily unavailable${weather.error ? ` (${escapeHtml(weather.error)})` : ""}.</p>
+             ${air ? `<div class="wx-now">${renderAqiChip(air)}</div>` : ""}`
+          : renderHourlyForecastChart(weather, air)
       }
       <script>
         (function () {
@@ -1649,10 +2690,16 @@ export function guestPaywallPage(opts: {
       </script>
       ${dashboardBlock}
       <div class="wx-radar">
-        <h3>Weather radar</h3>
-        <p class="meta" style="margin:0">Real-time weather radar · LibreWXR (NOAA MRMS)</p>
-        <div id="wx-radar-host" class="wx-radar-map-host" aria-label="Animated precipitation radar"></div>
-        <div class="wx-radar-scale"><span>Light</span><i></i><span>Heavy</span></div>
+        <h3>Weather Radar &amp; Wildfire</h3>
+        <p class="meta" style="margin:0">Precipitation · Ground Smoke</p>
+        <div id="wx-radar-host" class="wx-radar-map-host" aria-label="Weather, smoke, and wildfire map"></div>
+        <div class="wx-radar-scale"><span>Light rain</span><i></i><span>Heavy</span></div>
+        <div class="wx-radar-overlays">
+          <span><i class="wx-lg-smoke"></i> Ground Smoke</span>
+        </div>
+        <p class="wx-radar-links">
+          <a id="wx-watchduty-link" href="${escapeHtml(watchDutyHref)}" target="_blank" rel="noopener">Watch Duty map</a>
+        </p>
         <link rel="stylesheet" href="/vendor/leaflet/leaflet.css" />
         <script src="/vendor/leaflet/leaflet.js"></script>
         <script>
@@ -1665,12 +2712,22 @@ export function guestPaywallPage(opts: {
             fetch("/api/weather-radar", { cache: "no-store" })
               .then(function (r) { return r.json(); })
               .then(function (data) {
-                var radar = data && data.radar;
-                var frames = radar && Array.isArray(radar.frames) ? radar.frames : [];
-                if (!radar || !frames.length) {
-                  host.innerHTML = '<p class="wx-radar-fallback warn">Radar temporarily unavailable.</p>';
+                var radar = (data && data.radar) || {};
+                var frames = Array.isArray(radar.frames) ? radar.frames : [];
+                var hazards = (data && data.hazards) || {};
+                var lat = Number(radar.lat);
+                var lon = Number(radar.lon);
+                if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+                  lat = Number(data && data.geo && data.geo.lat);
+                  lon = Number(data && data.geo && data.geo.lon);
+                }
+                if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+                  host.innerHTML = '<p class="wx-radar-fallback warn">Map temporarily unavailable.</p>';
                   return;
                 }
+                var wd = document.getElementById("wx-watchduty-link");
+                if (wd && hazards.watchDutyUrl) wd.setAttribute("href", hazards.watchDutyUrl);
+
                 var wrap = document.createElement("div");
                 wrap.className = "wx-radar-map-wrap";
                 var mapEl = document.createElement("div");
@@ -1690,24 +2747,34 @@ export function guestPaywallPage(opts: {
                 wrap.appendChild(mapEl);
                 wrap.appendChild(controls);
                 host.replaceChildren(wrap);
+                if (!frames.length) controls.style.display = "none";
 
-                var lat = Number(radar.lat);
-                var lon = Number(radar.lon);
                 var maxZoom = Number(radar.maxZoom) || 12;
                 var minZoom = Number(radar.minZoom) || 5;
                 var startZoom = Number(radar.zoom);
-                if (!Number.isFinite(startZoom)) startZoom = 9;
-                var holdMs = Number(radar.frameMs);
-                if (!Number.isFinite(holdMs) || holdMs < 500) holdMs = 1200;
+                if (!Number.isFinite(startZoom)) startZoom = 8;
                 var blendMs = Number(radar.blendMs);
-                if (!Number.isFinite(blendMs) || blendMs < 200) blendMs = 800;
+                if (!Number.isFinite(blendMs) || blendMs < 80) blendMs = 220;
                 var opacity = Number(radar.opacity);
                 if (!Number.isFinite(opacity)) opacity = 0.72;
+                var radiusMi = Number(radar.radiusMi);
+                if (!Number.isFinite(radiusMi) || radiusMi <= 0) radiusMi = 40;
                 var map = L.map(mapEl, {
                   zoomControl: true,
                   attributionControl: false,
                   fadeAnimation: false,
+                  scrollWheelZoom: false,
+                  center: [lat, lon],
+                  zoom: startZoom,
+                  minZoom: minZoom,
                 });
+                map.createPane("smokePane");
+                map.getPane("smokePane").style.zIndex = 450;
+                map.createPane("roadsPane");
+                map.getPane("roadsPane").style.zIndex = 455;
+                map.getPane("roadsPane").style.pointerEvents = "none";
+                map.createPane("firePane");
+                map.getPane("firePane").style.zIndex = 460;
                 var bm = radar.basemap || {};
                 L.tileLayer(bm.url || "/wx-tiles/sat/{z}/{x}/{y}.jpg", {
                   attribution: "",
@@ -1715,13 +2782,20 @@ export function guestPaywallPage(opts: {
                   maxNativeZoom: 18,
                   minZoom: minZoom,
                 }).addTo(map);
+                L.tileLayer("/wx-tiles/roads/{z}/{x}/{y}.png", {
+                  attribution: "",
+                  maxZoom: Math.max(maxZoom, 18),
+                  maxNativeZoom: 18,
+                  minZoom: minZoom,
+                  pane: "roadsPane",
+                  opacity: 0.92,
+                }).addTo(map);
 
                 var frameIndex = Math.max(0, frames.length - 1);
                 for (var i = 0; i < frames.length; i++) {
                   if (frames[i].isCurrent) { frameIndex = i; break; }
                 }
 
-                // Preload every frame so playback only blends opacity (no URL swaps / tile flashes).
                 var layers = frames.map(function (frame, i) {
                   return L.tileLayer(frame.urlTemplate, {
                     opacity: 0,
@@ -1729,12 +2803,83 @@ export function guestPaywallPage(opts: {
                     maxNativeZoom: maxZoom,
                     minZoom: minZoom,
                     zIndex: 200 + i,
-                    updateWhenIdle: true,
-                    keepBuffer: 1,
+                    updateWhenIdle: false,
+                    updateWhenZooming: false,
+                    keepBuffer: 4,
+                    className: "wx-radar-layer",
+                    crossOrigin: true,
                   }).addTo(map);
                 });
 
-                map.setView([lat, lon], startZoom);
+                function centerBrc() {
+                  map.fitBounds(L.latLng(lat, lon).toBounds(radiusMi * 2 * 1609.344), {
+                    animate: false,
+                    padding: [12, 12],
+                  });
+                }
+                centerBrc();
+
+                var smokeFrames = Array.isArray(hazards.smokeFrames) ? hazards.smokeFrames : [];
+                var smokeBounds = hazards.smokeBounds || [[32, -160], [70, -52]];
+                var smokeOp = Number(hazards.smokeOpacity);
+                if (!Number.isFinite(smokeOp)) smokeOp = 0.65;
+                var smokeLayers = smokeFrames.map(function (sf) {
+                  return L.imageOverlay(sf.url, smokeBounds, {
+                    opacity: 0,
+                    pane: "smokePane",
+                    className: "wx-smoke-layer",
+                    crossOrigin: true,
+                  }).addTo(map);
+                });
+
+                function smokeIdxForFrame(idx) {
+                  var t = Number(frames[idx] && frames[idx].time);
+                  if (!Number.isFinite(t) || !smokeFrames.length) return -1;
+                  var hour = Math.floor(t / 3600) * 3600;
+                  var best = 0;
+                  var bestD = Infinity;
+                  for (var si = 0; si < smokeFrames.length; si++) {
+                    var d = Math.abs(Number(smokeFrames[si].time) - hour);
+                    if (d < bestD) {
+                      bestD = d;
+                      best = si;
+                    }
+                  }
+                  return best;
+                }
+
+                function setSmokeOpacities(fromSi, toSi, mix) {
+                  for (var i = 0; i < smokeLayers.length; i++) {
+                    var op = 0;
+                    if (i === toSi) op = smokeOp * mix;
+                    if (i === fromSi) op += smokeOp * (1 - mix);
+                    if (fromSi === toSi && i === toSi) op = smokeOp;
+                    smokeLayers[i].setOpacity(op);
+                  }
+                }
+
+                function showSmokeForFrame(idx) {
+                  setSmokeOpacities(smokeIdxForFrame(idx), smokeIdxForFrame(idx), 1);
+                }
+                if (hazards.perimeters && hazards.perimeters.features && hazards.perimeters.features.length) {
+                  L.geoJSON(hazards.perimeters, {
+                    pane: "firePane",
+                    style: {
+                      color: "#ff7a18",
+                      weight: 2.25,
+                      fillColor: "#ff4d00",
+                      fillOpacity: 0.22,
+                    },
+                    onEachFeature: function (feat, layer) {
+                      var p = (feat && feat.properties) || {};
+                      var acres = p.acres != null ? Math.round(Number(p.acres)).toLocaleString() + " ac" : "";
+                      var contained = p.contained != null ? Math.round(Number(p.contained)) + "% contained" : "";
+                      var bits = [p.name || "Fire", acres, contained].filter(Boolean);
+                      layer.bindPopup(bits.join(" · "));
+                    },
+                  }).addTo(map);
+                }
+
                 L.circleMarker([lat, lon], {
                   radius: 5,
                   color: "#8eb8ff",
@@ -1743,89 +2888,235 @@ export function guestPaywallPage(opts: {
                   fillOpacity: 0.85,
                 }).addTo(map);
 
-                var blending = false;
+                var flameSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><path fill="#ff3b00" d="M16 2c2 6-4 8-3 14 0 0 6-3 7-9 5 5 8 10 8 15a12 12 0 1 1-24 0C4 14 10 10 16 2z"/><path fill="#ffd166" d="M16 14c1.2 3-1.5 4.2-1 7.2 0 0 3-1.5 3.4-4.5 2.2 2.4 3.6 4.6 3.6 7.3A6 6 0 1 1 10 24c0-3.6 3.2-5.8 6-10z"/></svg>';
+                var flameIcon = L.divIcon({
+                  className: "wx-flame-icon",
+                  html: flameSvg,
+                  iconSize: [28, 28],
+                  iconAnchor: [14, 26],
+                  popupAnchor: [0, -22],
+                });
+                var fires = Array.isArray(hazards.fires) ? hazards.fires : [];
+                for (var fi = 0; fi < fires.length; fi++) {
+                  var fire = fires[fi];
+                  var fy = Number(fire.lat);
+                  var fx = Number(fire.lon);
+                  if (!Number.isFinite(fy) || !Number.isFinite(fx)) continue;
+                  var acresTxt = fire.acres != null ? Math.round(Number(fire.acres)).toLocaleString() + " ac" : "";
+                  var containTxt = fire.contained != null ? Math.round(Number(fire.contained)) + "% contained" : "";
+                  var pop = [fire.name || "Fire", acresTxt, containTxt, fire.behavior].filter(Boolean).join(" · ");
+                  L.marker([fy, fx], { icon: flameIcon, zIndexOffset: 400 }).addTo(map).bindPopup(pop);
+                }
 
-                function updateChrome(idx) {
+                centerBrc();
+
+                var BUFFER_AHEAD = Math.min(8, Math.max(3, frames.length));
+                var preloadCache = Object.create(null);
+                var layerOp = [];
+                var playing = false;
+                var loopStart = 0;
+                var lastPrefetchFrom = -1;
+                var weights = frames.map(function (f) {
+                  return f && f.isCurrent ? 1.15 : 1;
+                });
+                var weightSum = 0;
+                for (var wi = 0; wi < weights.length; wi++) weightSum += weights[wi];
+
+                function preloadUrl(url) {
+                  if (!url) return Promise.resolve(false);
+                  if (preloadCache[url]) return preloadCache[url];
+                  preloadCache[url] = new Promise(function (resolve) {
+                    var img = new Image();
+                    img.decoding = "async";
+                    img.onload = function () { resolve(true); };
+                    img.onerror = function () { resolve(false); };
+                    img.src = url;
+                  });
+                  return preloadCache[url];
+                }
+
+                function tileUrlsForFrame(frame) {
+                  if (!frame || !frame.urlTemplate) return [];
+                  var z = map.getZoom();
+                  var b = map.getBounds();
+                  var nw = map.project(b.getNorthWest(), z);
+                  var se = map.project(b.getSouthEast(), z);
+                  var pad = 256;
+                  var minX = Math.floor((nw.x - pad) / 256);
+                  var maxX = Math.floor((se.x + pad) / 256);
+                  var minY = Math.floor((nw.y - pad) / 256);
+                  var maxY = Math.floor((se.y + pad) / 256);
+                  var n = Math.pow(2, z);
+                  var urls = [];
+                  for (var x = minX; x <= maxX; x++) {
+                    for (var y = minY; y <= maxY; y++) {
+                      if (y < 0 || y >= n) continue;
+                      var xx = ((x % n) + n) % n;
+                      urls.push(
+                        frame.urlTemplate
+                          .replace("{z}", String(z))
+                          .replace("{x}", String(xx))
+                          .replace("{y}", String(y))
+                      );
+                    }
+                  }
+                  return urls;
+                }
+
+                function prefetchFrame(idx) {
                   var frame = frames[idx];
+                  if (!frame) return Promise.resolve();
+                  var urls = tileUrlsForFrame(frame);
+                  var si = smokeIdxForFrame(idx);
+                  if (si >= 0 && smokeFrames[si] && smokeFrames[si].url) {
+                    urls.push(smokeFrames[si].url);
+                  }
+                  return Promise.all(urls.map(preloadUrl));
+                }
+
+                function fillBuffer(fromIdx, count) {
+                  var n = Math.min(count || BUFFER_AHEAD, frames.length);
+                  var idxs = [];
+                  for (var i = 0; i < n; i++) {
+                    idxs.push((fromIdx + i + frames.length) % frames.length);
+                  }
+                  var k = 0;
+                  function worker() {
+                    if (k >= idxs.length) return Promise.resolve();
+                    var fi = idxs[k++];
+                    return prefetchFrame(fi).then(worker);
+                  }
+                  var workers = [];
+                  var wc = Math.min(3, idxs.length);
+                  for (var j = 0; j < wc; j++) workers.push(worker());
+                  return Promise.all(workers);
+                }
+
+                function updateChrome(fromIdx, toIdx, mix) {
+                  var m = mix == null ? 1 : mix;
                   var denom = Math.max(1, frames.length - 1);
-                  progressFill.style.width = (idx / denom) * 100 + "%";
+                  var pos;
+                  if (toIdx < fromIdx) {
+                    pos = m < 1 ? 1 : 0;
+                  } else {
+                    pos = (fromIdx + (toIdx - fromIdx) * m) / denom;
+                  }
+                  progressFill.style.width = pos * 100 + "%";
+                  var frame = frames[m < 0.5 ? fromIdx : toIdx];
                   timeEl.textContent = frame && frame.label ? frame.label : "";
                 }
 
-                function easeInOut(t) {
-                  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+                function setLayerOpacity(idx, op) {
+                  if (!layers[idx]) return;
+                  if (layerOp[idx] === op) return;
+                  layerOp[idx] = op;
+                  layers[idx].setOpacity(op);
                 }
 
-                function crossfade(fromIdx, toIdx, done) {
-                  var from = layers[fromIdx];
-                  var to = layers[toIdx];
-                  if (!from || !to) {
-                    if (done) done();
+                function lerpUnix(fromIdx, toIdx, mix) {
+                  var a = Number(frames[fromIdx] && frames[fromIdx].time);
+                  var b = Number(frames[toIdx] && frames[toIdx].time);
+                  if (!Number.isFinite(a)) return b;
+                  if (!Number.isFinite(b) || b < a) return mix < 0.5 ? a : b;
+                  return a + (b - a) * mix;
+                }
+
+                function applySmokeUnix(unix) {
+                  if (!smokeLayers.length) return;
+                  if (smokeFrames.length === 1) {
+                    smokeLayers[0].setOpacity(smokeOp);
                     return;
                   }
-                  blending = true;
-                  var start = performance.now();
-                  to.setOpacity(0);
-                  from.setOpacity(opacity);
-                  function step(now) {
-                    var t = Math.min(1, (now - start) / blendMs);
-                    var e = easeInOut(t);
-                    to.setOpacity(opacity * e);
-                    from.setOpacity(opacity * (1 - e));
-                    if (t < 1) {
-                      requestAnimationFrame(step);
-                      return;
-                    }
-                    from.setOpacity(0);
-                    to.setOpacity(opacity);
-                    blending = false;
-                    if (done) done();
+                  var t = Number(unix);
+                  if (!Number.isFinite(t)) {
+                    showSmokeForFrame(frameIndex);
+                    return;
                   }
-                  requestAnimationFrame(step);
+                  var i1 = 0;
+                  for (var i = 0; i < smokeFrames.length - 1; i++) {
+                    if (Number(smokeFrames[i].time) <= t) i1 = i;
+                  }
+                  var i2 = Math.min(i1 + 1, smokeFrames.length - 1);
+                  var t1 = Number(smokeFrames[i1].time);
+                  var t2 = Number(smokeFrames[i2].time);
+                  var u = i1 === i2 || t2 === t1 ? 1 : (t - t1) / (t2 - t1);
+                  u = Math.max(0, Math.min(1, u));
+                  setSmokeOpacities(i1, i2, u);
                 }
 
-                function dwellMs(idx) {
-                  var frame = frames[idx];
-                  if (frame && frame.isCurrent) return Math.round(holdMs * 1.75);
-                  return holdMs;
+                function playheadAt(now) {
+                  var loopMs = Math.max(1, blendMs * weightSum);
+                  var u = (now - loopStart) % loopMs;
+                  if (u < 0) u += loopMs;
+                  var acc = 0;
+                  for (var i = 0; i < frames.length; i++) {
+                    var span = weights[i] * blendMs;
+                    if (u <= acc + span || i === frames.length - 1) {
+                      var local = span <= 0 ? 1 : (u - acc) / span;
+                      local = Math.max(0, Math.min(1, local));
+                      return { from: i, to: (i + 1) % frames.length, mix: local };
+                    }
+                    acc += span;
+                  }
+                  return { from: 0, to: Math.min(1, frames.length - 1), mix: 0 };
                 }
 
                 function showInitial(idx) {
                   frameIndex = idx;
-                  updateChrome(idx);
+                  updateChrome(idx, idx, 1);
+                  showSmokeForFrame(idx);
                   for (var j = 0; j < layers.length; j++) {
-                    layers[j].setOpacity(j === idx ? opacity : 0);
+                    setLayerOpacity(j, j === idx ? opacity : 0);
                   }
                 }
 
-                function tick() {
-                  if (blending || layers.length < 2) {
-                    setTimeout(tick, holdMs);
-                    return;
+                function paint(now) {
+                  if (!playing || layers.length < 2) return;
+                  var ph = playheadAt(now);
+                  var from = ph.from;
+                  var to = ph.to;
+                  var mix = ph.mix;
+                  if (from !== lastPrefetchFrom) {
+                    lastPrefetchFrom = from;
+                    frameIndex = from;
+                    fillBuffer((to + 1) % frames.length, BUFFER_AHEAD);
                   }
-                  var next = (frameIndex + 1) % frames.length;
-                  var from = frameIndex;
-                  updateChrome(next);
-                  crossfade(from, next, function () {
-                    frameIndex = next;
-                    setTimeout(tick, dwellMs(next));
+                  setLayerOpacity(from, opacity * (1 - mix));
+                  if (to !== from) setLayerOpacity(to, opacity * mix);
+                  for (var j = 0; j < layers.length; j++) {
+                    if (j !== from && j !== to) setLayerOpacity(j, 0);
+                  }
+                  applySmokeUnix(lerpUnix(from, to, mix));
+                  updateChrome(from, to, mix);
+                  requestAnimationFrame(paint);
+                }
+
+                function begin() {
+                  if (playing) return;
+                  playing = true;
+                  loopStart = performance.now();
+                  requestAnimationFrame(paint);
+                }
+
+                if (layers.length) {
+                  showInitial(0);
+                  requestAnimationFrame(function () {
+                    map.invalidateSize();
+                    centerBrc();
+                    for (var s = 0; s < smokeFrames.length; s++) preloadUrl(smokeFrames[s].url);
+                    fillBuffer(0, Math.min(3, BUFFER_AHEAD)).then(begin);
+                    fillBuffer(0, frames.length);
+                    setTimeout(begin, 900);
+                    map.on("zoomend moveend", function () {
+                      fillBuffer(frameIndex, BUFFER_AHEAD);
+                    });
+                  });
+                } else {
+                  requestAnimationFrame(function () {
+                    map.invalidateSize();
+                    centerBrc();
                   });
                 }
-
-                showInitial(frameIndex);
-                requestAnimationFrame(function () {
-                  map.invalidateSize();
-                  // Let the starting frame's tiles settle before looping.
-                  var starter = layers[frameIndex];
-                  var started = false;
-                  function begin() {
-                    if (started) return;
-                    started = true;
-                    setTimeout(tick, dwellMs(frameIndex));
-                  }
-                  if (starter) starter.once("load", begin);
-                  setTimeout(begin, 1200);
-                });
               })
               .catch(function () {
                 host.innerHTML = '<p class="wx-radar-fallback warn">Radar temporarily unavailable.</p>';
@@ -1834,6 +3125,16 @@ export function guestPaywallPage(opts: {
         </script>
       </div>
     </div>`;
+
+  const dataPanel =
+    starlinkData?.operator
+      ? starlinkDataPanel({
+          view: starlinkData,
+          flash: dataFlash,
+          error: dataError,
+          compact: true,
+        })
+      : "";
 
   const resetAccessButton = mac
     ? `<form method="POST" action="/reset-access" style="margin-top:0.75rem">
@@ -1845,10 +3146,12 @@ export function guestPaywallPage(opts: {
     return layout(
       "Connected",
       `
-      ${guestBrand({ tempUnit: true })}
-      ${guestTabs("portal")}
+      ${guestBrand()}
+      ${dataPanel}
       <h1>Welcome to ${escapeHtml(settings.camp_name)}</h1>
+      ${saveHomePageBlock()}
       ${bmirListenButton()}
+      ${innovateAppsPanel()}
       ${weatherPanel}
       <p class="ok">This device is unlocked${paidUntil ? ` until ${escapeHtml(new Date(paidUntil).toLocaleString())}` : ""}.</p>
       <div class="panel">
@@ -1866,11 +3169,13 @@ export function guestPaywallPage(opts: {
   return layout(
     settings.camp_name,
     `
-    ${guestBrand({ tempUnit: true })}
-    ${guestTabs("portal")}
+    ${guestBrand()}
+    ${dataPanel}
     <h1>Welcome to Phage Camp<br>Emergency Starlink by Jaybird</h1>
+    ${saveHomePageBlock()}
     ${bmirListenButton()}
     ${weatherPanel}
+    ${innovateAppsPanel()}
     <div class="panel">
       <a class="btn" href="/access">Emergency Internet Access</a>
     </div>
@@ -1885,9 +3190,9 @@ export function guestPaywallPage(opts: {
 
 function fullAccessIntro(error?: string): string {
   return `
-    <div class="panel">
-      <p class="lede" style="margin-top:0">Internet access on playa isn’t really supposed to be a gifting thing I’m bringing to playa. I brought it because part of my work involves being on call during hurricane season. I don’t want to impact the collective digital detox out on playa so please consider before using. Payment is considered to be an optional donation and is appreciated but not required.</p>
-      <p>Also please ask for consent before sharing any news from the Default World that you might see online. We want to respect that others may be wanting to take a break from news exposure for the week.</p>
+    <div class="panel access-intro">
+      <p class="lede">Internet access on playa isn’t really supposed to be a gifting thing I’m bringing to playa. I brought it because part of my work involves being on call during hurricane season. I don’t want to impact the collective digital detox out on playa so <strong>please consider before using</strong>. Payment is considered to be an <strong>optional donation</strong> and is appreciated but not required.</p>
+      <p class="access-note">Also please ask for consent before sharing any news from the Default World that you might see online. We want to respect that others may be wanting to take a break from news exposure for the week.</p>
       ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
     </div>`;
 }
@@ -1944,9 +3249,9 @@ function fullAccessFormFields(opts: {
 
   return `
           ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
-          <form method="POST" action="/pay/manual" id="full-access-form" autocomplete="off"${showContinue ? "" : ` onsubmit="return false;"`}>
+          <form method="POST" action="/pay/manual" id="full-access-form" class="access-pay" autocomplete="off"${showContinue ? "" : ` onsubmit="return false;"`}>
           <input type="hidden" name="mac" value="${escapeHtml(mac)}" />
-          <h3 style="margin-top:0">Default World Access Tax</h3>
+          <h3 class="access-tax">Default World Access Tax</h3>
           ${playaField}
           <label for="donation-tier">Amount</label>
           <select id="donation-tier" name="amount_cents" required autocomplete="off">
@@ -1958,11 +3263,13 @@ function fullAccessFormFields(opts: {
             <label for="custom-amount">Custom Amount</label>
             <input id="custom-amount" name="custom_amount" type="number" min="1" max="1000" step="0.01" inputmode="decimal" placeholder="25.00" value="" autocomplete="off" />
           </div>
-          <label for="pay-method">Payment method</label>
-          <select id="pay-method" name="method" required autocomplete="off">
-            <option value="" disabled selected>– Select –</option>
-            ${methodOptions}
-          </select>
+          <div id="pay-method-wrap" class="pay-method-field">
+            <label for="pay-method">Payment method</label>
+            <select id="pay-method" name="method" required autocomplete="off">
+              <option value="" disabled selected>– Select –</option>
+              ${methodOptions}
+            </select>
+          </div>
           <div id="pay-to-panel" class="pay-method" hidden>
             <h3 id="pay-to-title" style="margin-top:0"></h3>
             <p class="meta" id="pay-to-copy" style="margin:0"></p>
@@ -1985,6 +3292,7 @@ function fullAccessFormFields(opts: {
               methods = JSON.parse(document.getElementById("pay-methods-data").textContent || "{}");
             } catch (e) {}
             var methodEl = document.getElementById("pay-method");
+            var methodWrap = document.getElementById("pay-method-wrap");
             var amountEl = document.getElementById("donation-tier");
             var customWrap = document.getElementById("custom-amount-wrap");
             var customEl = document.getElementById("custom-amount");
@@ -2075,7 +3383,7 @@ function fullAccessFormFields(opts: {
 
             function setCopy(amt, handle, method) {
               copy.textContent = "";
-              if (amt <= 0 && method === "cash") {
+              if (amt <= 0) {
                 copy.appendChild(document.createTextNode("No donation needed for this option."));
                 return;
               }
@@ -2085,14 +3393,6 @@ function fullAccessFormFields(opts: {
                     "Leave it with Jaybird or toss it in her Ambulance. Thanks!",
                   ),
                 );
-                return;
-              }
-              if (amt <= 0) {
-                copy.appendChild(document.createTextNode("No donation needed for this option. Camp receive handle: "));
-                var z = document.createElement("span");
-                z.className = "handle";
-                z.textContent = handle;
-                copy.appendChild(z);
                 return;
               }
               copy.appendChild(document.createTextNode("Send "));
@@ -2112,7 +3412,7 @@ function fullAccessFormFields(opts: {
               var m = methodEl.value;
               var cents = effectiveCents();
               var info = methods[m];
-              if (!m || cents == null) {
+              if (!m || cents == null || cents === 0) {
                 panel.hidden = true;
                 return;
               }
@@ -2200,8 +3500,11 @@ function fullAccessFormFields(opts: {
             }
 
             function syncMethodRequired() {
-              var zero = amountEl.value === "0";
+              var zero = effectiveCents() === 0;
               methodEl.required = !zero;
+              methodEl.disabled = zero;
+              if (methodWrap) methodWrap.classList.toggle("is-disabled", zero);
+              if (zero) methodEl.selectedIndex = 0;
             }
 
             methodEl.addEventListener("change", function () {
@@ -2253,6 +3556,8 @@ export function emergencyAccessPage(opts: {
   membersUnlocked?: boolean;
   membersGateChallenge: { id: string; question: string; answerLabel: string };
   error?: string;
+  guestHoldActive?: boolean;
+  reservedGb?: number | null;
 }): string {
   const {
     settings,
@@ -2265,11 +3570,13 @@ export function emergencyAccessPage(opts: {
     membersUnlocked = false,
     membersGateChallenge,
     error,
+    guestHoldActive = false,
+    reservedGb = null,
   } = opts;
   const deviceNote = mac ?? "unknown";
   const resetAccessButton = mac
     ? `<form method="POST" action="/reset-access" style="margin-top:0.75rem">
-        <button class="btn small danger" type="submit">Testing: revoke my internet access</button>
+        <button class="btn small danger ghost" type="submit">Testing: revoke my internet access</button>
       </form>`
     : "";
 
@@ -2277,7 +3584,6 @@ export function emergencyAccessPage(opts: {
     "Internet access",
     `
     ${guestBrand()}
-    ${guestTabs("portal")}
     <p class="nav" style="margin:0 0 1rem"><a href="/">← Back</a></p>
     ${fullAccessIntro(error)}
     ${emergencyAccessBlock({
@@ -2290,9 +3596,11 @@ export function emergencyAccessPage(opts: {
       playaName,
       draft,
       error: undefined,
+      guestHoldActive,
+      reservedGb,
     })}
     <p class="meta">Device: ${escapeHtml(deviceNote)}</p>
-    <p style="margin:0.85rem 0 0"><a class="btn secondary" href="/" style="display:inline-block;text-align:center;text-decoration:none;box-sizing:border-box">Back</a></p>
+    <p class="nav" style="margin:0.85rem 0 0"><a href="/">Back</a></p>
     ${resetAccessButton}
     ${playaNameGate(askPlayaName)}
     `,
@@ -2308,11 +3616,11 @@ export function successPage(opts: { message: string; ok: boolean; mac?: string }
     <p class="${opts.ok ? "ok" : "warn"}">${escapeHtml(opts.message)}</p>
     ${opts.mac ? `<p class="meta">Device ${escapeHtml(opts.mac)}</p>` : ""}
     <div class="panel">
-      <a class="btn" href="/">Back to portal</a>
+      <a class="btn" href="${escapeHtml(OUTSIDE_BROWSE_HREF)}">Continue browsing</a>
     </div>
     <script>
       // Captive portals often need a hop to mark success
-      setTimeout(() => { location.href = '/'; }, 2500);
+      setTimeout(() => { location.href = ${JSON.stringify(OUTSIDE_BROWSE_HREF)}; }, 2500);
     </script>
     `,
   );
@@ -2341,6 +3649,7 @@ export function adminDashboard(opts: {
   payments: Payment[];
   siteWhitelist: SiteWhitelistEntry[];
   flash?: string;
+  starlinkData?: StarlinkDataOperatorView;
 }): string {
   const { settings, devices, pending, payments, siteWhitelist, flash } = opts;
 
@@ -2446,6 +3755,11 @@ export function adminDashboard(opts: {
     <div class="brand">Controls</div>
     <h1>${escapeHtml(settings.camp_name)}</h1>
     ${flash ? `<p class="ok">${escapeHtml(flash)}</p>` : ""}
+    ${
+      opts.starlinkData
+        ? starlinkDataPanel({ view: opts.starlinkData, compact: false })
+        : ""
+    }
 
     <form method="POST" action="/admin/settings" class="panel">
       <h2>Settings</h2>
@@ -2498,7 +3812,8 @@ export function adminDashboard(opts: {
 
     <div class="panel">
       <h2>Site whitelist (${siteWhitelist.length})</h2>
-      <p class="meta">Always open (never blocked): Venmo, PayPal, Zelle, thephage.org.</p>
+      <p class="meta">Always open (never blocked): payment apps, thephage.org, Burning Man, Innovate showcase apps, BMIR, Spotify, Watch Duty, and the CDNs those pages need.</p>
+      <p class="meta">Always blocked (every device, paid or not): TikTok, Reddit, Google News, and major news sites/feeds. Crowd approval cannot open them.</p>
       <p class="meta" style="margin-top:0.35rem">${PERMANENT_WHITELIST_DOMAINS.map((d) => `<code>${escapeHtml(d)}</code>`).join(" · ")}</p>
       <p class="meta">Crowd approval: ${SITE_WHITELIST_VOTES_NEEDED} unique device MACs must request the exact same URL.</p>
       ${
@@ -2604,7 +3919,6 @@ export function guestEventsPage(opts: {
     "Events",
     `
     ${guestBrand()}
-    ${guestTabs("events")}
     <div class="events-head">
       <h1>Events</h1>
       <button type="button" class="btn small secondary" id="save-offline" title="Download favorites as offline HTML">Save offline calendar</button>

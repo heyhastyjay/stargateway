@@ -3,8 +3,8 @@
  * @see https://mesonet.agron.iastate.edu/ogc/
  */
 
-/** Default reference radius (miles from camp) for embed metadata. */
-export const RADAR_RADIUS_MI = 20;
+/** Default view radius (miles from camp). The playa is featureless at closer zooms. */
+export const RADAR_RADIUS_MI = 40;
 export const IEM_TILE_BASE = "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0";
 /** Esri World Imagery — satellite basemap (proxied via `/wx-tiles/sat`). */
 export const ESRI_SAT_URL =
@@ -20,7 +20,7 @@ export const IEM_ATTR =
   'Radar &copy; <a href="https://mesonet.agron.iastate.edu/ogc/">Iowa Environmental Mesonet</a>';
 
 const MIN_ZOOM = 5;
-const DEFAULT_ZOOM = 9;
+const DEFAULT_ZOOM = 8;
 const MAX_ZOOM = 12;
 
 export interface IemRadarFrame {
@@ -49,6 +49,8 @@ export interface IemRadarPayload {
   };
   radarAttribution: string;
   opacity: number;
+  frameMs: number;
+  blendMs: number;
   frames: IemRadarFrame[];
   mapPageUrl: string;
 }
@@ -185,6 +187,8 @@ export function buildIemRadarPayload(
     },
     radarAttribution: IEM_ATTR,
     opacity: 0.68,
+    frameMs: 0,
+    blendMs: 220,
     frames: frames.map((f) => ({
       id: f.id,
       time: f.time,

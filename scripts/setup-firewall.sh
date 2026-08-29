@@ -34,6 +34,16 @@ table inet ${TABLE} {
     flags interval
   }
 
+  set blocked_dests {
+    type ipv4_addr
+    flags interval
+  }
+
+  set blocked_dests6 {
+    type ipv6_addr
+    flags interval
+  }
+
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
     iifname "${LAN_INTERFACE}" ether saddr @allowed_macs accept
@@ -51,6 +61,8 @@ table inet ${TABLE} {
 
   chain forward {
     type filter hook forward priority filter; policy drop;
+    ip daddr @blocked_dests drop
+    ip6 daddr @blocked_dests6 drop
     ct state established,related accept
     iifname "${LAN_INTERFACE}" oifname "${WAN_INTERFACE}" ether saddr @allowed_macs accept
     iifname "${LAN_INTERFACE}" oifname "${WAN_INTERFACE}" ip daddr @allowed_dests accept
@@ -71,3 +83,4 @@ echo "nftables table '${TABLE}' installed."
 echo "  LAN=${LAN_INTERFACE} WAN=${WAN_INTERFACE} portal=${PORTAL_IP}:${PORTAL_PORT}"
 echo "Allow MACs with: nft add element inet ${TABLE} allowed_macs '{ aa:bb:cc:dd:ee:ff }'"
 echo "Crowd-approved site IPs go in: allowed_dests"
+echo "Always-blocked destinations (TikTok, Reddit, news) go in: blocked_dests / blocked_dests6"
